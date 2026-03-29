@@ -9,6 +9,11 @@ class AppConfig:
     db_path: Path = Path("proxy_pool.sqlite3")
     sources_file: Path = Path("sources.txt")
     export_file: Path = Path("result.txt")
+
+    # Local GeoIP settings (file-only lookups, no network API calls during resolution)
+    geoip_db_path: Path = Path("geoip/GeoLite2-City.mmdb")
+    geoip_db_url: str | None = None
+
     # URL test settings
     url_batch_size: int = 20
     url_timeout_seconds: float = 1.0
