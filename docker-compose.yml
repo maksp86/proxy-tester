@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  proxy-tester:
+    build: .
+    container_name: proxy-tester
+    restart: unless-stopped
+    volumes:
+      - ./sources.txt:/app/sources.txt:ro
+      - ./geoip:/app/geoip
+    command: ["python", "main.py", "--verbose"]

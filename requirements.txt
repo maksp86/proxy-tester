@@ -1,0 +1,2 @@
+python-v2ray
+geoip2

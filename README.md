@@ -9,16 +9,20 @@ Nightly pipeline for collecting subscription links, filtering dead proxies, URL 
 - Subscription source loading from `sources.txt`.
 - Candidate parsing and deduplication.
 - URL test + speed test orchestration with parallel batches.
+- Local-file GeoIP enrichment (MaxMind `.mmdb`) for exit IP metadata.
 - Export format with comment replacement (`link # IP=... | Geo=... | URL=... | Speed=...`).
 - CLI entrypoint (`python main.py`).
-
-> Note: `app/probe.py` is an adapter stub and should be replaced with real Xray/libXray/python_v2ray-backed checks.
 
 ## Run
 
 ```bash
+pip install -r requirements.txt
 python main.py --verbose
 ```
+
+## GeoIP database
+
+Configure path in `AppConfig.geoip_db_path`. If `AppConfig.geoip_db_url` is set, the `.mmdb` file is downloaded at startup to that path. During tests and lookups only the local file path is used.
 
 ## Scheduler
 
