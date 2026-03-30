@@ -6,6 +6,6 @@ services:
     container_name: proxy-tester
     restart: unless-stopped
     volumes:
-      - ./sources.txt:/app/sources.txt:ro
+      - ./config.json:/app/config.json:ro
       - ./geoip:/app/geoip
-    command: ["python", "main.py", "--verbose"]
+    command: ["python", "main.py", "--config", "config.json", "--verbose"]

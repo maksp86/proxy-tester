@@ -205,3 +205,16 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# proxy-tester runtime artifacts
+config.json
+proxy_pool.sqlite3
+proxy_pool.sqlite3-*
+result.txt
+geoip/*.mmdb
+
+# python-v2ray downloaded binaries/artifacts
+vendor/
+core_engine/
+python_v2ray_vendor/
+*.v2ray.log
