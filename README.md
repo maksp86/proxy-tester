@@ -6,9 +6,10 @@ Nightly pipeline for collecting subscription links, filtering dead proxies, URL 
 
 - SQLite schema and lifecycle for proxies, URL tests, speed tests, dead-list TTL, and selected final proxies.
 - Dead-list cleanup on each run.
-- Subscription source loading from `sources.txt`.
+- Subscription loading from JSON config (`subscription_urls`).
 - Candidate parsing and deduplication.
-- URL test + speed test orchestration with parallel batches.
+- URL test + speed test orchestration with batched checks.
+- Progress bars for long-running stages via `tqdm`.
 - Local-file GeoIP enrichment (MaxMind `.mmdb`) for exit IP metadata.
 - Export format with comment replacement (`link # IP=... | Geo=... | URL=... | Speed=...`).
 - CLI entrypoint (`python main.py`).
@@ -17,7 +18,8 @@ Nightly pipeline for collecting subscription links, filtering dead proxies, URL 
 
 ```bash
 pip install -r requirements.txt
-python main.py --verbose
+cp config.json.example config.json
+python main.py --config config.json --verbose
 ```
 
 ## GeoIP database
@@ -29,5 +31,9 @@ Configure path in `AppConfig.geoip_db_path`. If `AppConfig.geoip_db_url` is set,
 Recommended cron (once per day at 03:10):
 
 ```cron
-10 3 * * * cd /path/to/repo && /usr/bin/python3 main.py >> nightly.log 2>&1
+10 3 * * * cd /path/to/repo && /usr/bin/python3 main.py --config config.json >> nightly.log 2>&1
 ```
+
+## Config file
+
+Only JSON config is supported. Start from `config.json.example` and update values for your environment.

@@ -1,0 +1,24 @@
+{
+  "db_path": "proxy_pool.sqlite3",
+  "export_file": "result.txt",
+  "subscription_urls": [
+    "https://example.com/subscription-1",
+    "https://example.com/subscription-2"
+  ],
+  "geoip_db_path": "geoip/GeoLite2-City.mmdb",
+  "geoip_db_url": null,
+  "url_batch_size": 20,
+  "url_timeout_seconds": 1.0,
+  "url_urls": [
+    "https://www.gstatic.com/generate_204",
+    "https://www.youtube.com/generate_204",
+    "https://x.com"
+  ],
+  "speed_top_n": 100,
+  "speed_batch_size": 5,
+  "speed_timeout_seconds": 10.0,
+  "speed_min_mb_s": 1.0,
+  "speed_test_url": "https://github.com/jamesward/play-load-tests/raw/refs/heads/master/public/10mb.txt",
+  "target_final_count": 25,
+  "dead_ttl_days": 30
+}
