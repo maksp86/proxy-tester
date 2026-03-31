@@ -38,6 +38,7 @@ async def _run_url_tests(
     candidates: list[CandidateProxy],
     urls: tuple[str, ...],
     timeout_s: float,
+    attempts: int,
     batch_size: int,
 ) -> list[UrlTestResult]:
     """Execute URL tests by batches with detailed logs and progress bar."""
@@ -46,7 +47,12 @@ async def _run_url_tests(
     batches = list(_chunks(candidates, batch_size))
     for index, batch in enumerate(tqdm(batches, desc="URL tests", unit="batch"), start=1):
         LOGGER.info("URL batch %s started (size=%s)", index, len(batch))
-        batch_results = await probe.url_test_batch(list(batch), urls=urls, timeout_s=timeout_s)
+        batch_results = await probe.url_test_batch(
+            list(batch),
+            urls=urls,
+            timeout_s=timeout_s,
+            attempts=attempts,
+        )
         ok_count = sum(1 for item in batch_results if item.success)
         LOGGER.info("URL batch %s finished: ok=%s fail=%s", index, ok_count, len(batch_results) - ok_count)
         results.extend(batch_results)
@@ -142,6 +148,7 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
         candidates,
         config.url_urls,
         config.url_timeout_seconds,
+        config.url_test_attempts,
         config.url_batch_size,
     )
 
@@ -193,6 +200,7 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
 
     speed_by_hash = {r.proxy_hash: r for r in speed_results}
     final: list[dict] = []
+    rejected_after_speed: set[str] = set()
 
     for row in tqdm(top_for_speed, desc="Persist speed results", unit="proxy"):
         s = speed_by_hash.get(row["proxy_hash"])
@@ -208,9 +216,11 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
         )
         if not s.success:
             db.mark_dead(s.proxy_hash, reason=s.reason or "speed_test_failed", ttl_days=config.dead_ttl_days)
+            rejected_after_speed.add(s.proxy_hash)
             continue
         if (s.mbps or 0.0) < config.speed_min_mb_s:
             db.mark_dead(s.proxy_hash, reason="below_speed_threshold", ttl_days=config.dead_ttl_days)
+            rejected_after_speed.add(s.proxy_hash)
             continue
         row["mbps"] = s.mbps
         final.append(row)
@@ -221,6 +231,8 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
         if len(final) >= config.target_final_count:
             break
         if row["proxy_hash"] in used:
+            continue
+        if row["proxy_hash"] in rejected_after_speed:
             continue
         row = dict(row)
         row.setdefault("mbps", None)

@@ -19,6 +19,7 @@ class AppConfig:
         geoip_db_url: Optional URL for downloading `geoip_db_path` at startup.
         url_batch_size: Number of proxies processed in a single URL-test batch.
         url_timeout_seconds: Timeout for URL reachability checks.
+        url_test_attempts: Number of URL-test attempts per proxy (best latency wins).
         url_urls: Candidate healthcheck URLs; first URL is used as probe target.
         speed_top_n: Number of lowest-latency proxies to include in speed stage.
         speed_batch_size: Number of proxies processed in a single speed-test batch.
@@ -40,6 +41,7 @@ class AppConfig:
     # URL test settings
     url_batch_size: int = 20
     url_timeout_seconds: float = 1.0
+    url_test_attempts: int = 1
     url_urls: tuple[str, ...] = (
         "https://www.gstatic.com/generate_204",
         "https://www.youtube.com/generate_204",
