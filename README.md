@@ -9,6 +9,8 @@ Nightly pipeline for collecting subscription links, filtering dead proxies, URL 
 - Subscription loading from JSON config (`subscription_urls`).
 - Candidate parsing and deduplication via external ProxyConverter.
 - URL test + speed test orchestration with batched checks via Xray-core runtime.
+- Configurable retry count for URL tests (`url_test_attempts`), keeping the best latency per proxy.
+- Speed-test failures are excluded from final selection (no fallback with `NULL` speed for failed speed checks).
 - Progress bars for long-running stages via `tqdm`.
 - Local-file GeoIP enrichment (MaxMind `.mmdb`) for exit IP metadata.
 - Export format with comment replacement (`link # IP=... | Geo=... | URL=... | Speed=...`).

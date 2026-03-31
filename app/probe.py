@@ -81,6 +81,7 @@ class ProxyProbe:
         candidates: list[CandidateProxy],
         urls: tuple[str, ...],
         timeout_s: float,
+        attempts: int = 1,
     ) -> list[UrlTestResult]:
         if not candidates:
             return []
@@ -101,7 +102,13 @@ class ProxyProbe:
 
         async def _one(candidate: CandidateProxy) -> UrlTestResult:
             async with semaphore:
-                return await self._url_test_candidate(candidate, configs_by_link, ping_url, timeout_s)
+                return await self._url_test_candidate(
+                    candidate,
+                    configs_by_link,
+                    ping_url,
+                    timeout_s,
+                    attempts=max(1, attempts),
+                )
 
         return list(await asyncio.gather(*(_one(candidate) for candidate in candidates)))
 
@@ -111,6 +118,7 @@ class ProxyProbe:
         configs_by_link: dict[str, dict],
         ping_url: str,
         timeout_s: float,
+        attempts: int,
     ) -> UrlTestResult:
         config = configs_by_link.get(candidate.raw_link)
         if config is None:
@@ -121,8 +129,19 @@ class ProxyProbe:
             return UrlTestResult(proxy_hash=candidate.proxy_hash, success=False, reason="missing_socks_inbound")
 
         async with _xray_runtime(self._toolchain.xray_path, config, socks_port):
-            ok, latency_ms = await _http_probe_url(socks_port=socks_port, test_url=ping_url, timeout_s=timeout_s)
-            if not ok:
+            best_latency_ms: float | None = None
+            for _ in range(attempts):
+                ok, latency_ms = await _http_probe_url(
+                    socks_port=socks_port,
+                    test_url=ping_url,
+                    timeout_s=timeout_s,
+                )
+                if ok and latency_ms is not None and (
+                    best_latency_ms is None or latency_ms < best_latency_ms
+                ):
+                    best_latency_ms = latency_ms
+
+            if best_latency_ms is None:
                 return UrlTestResult(proxy_hash=candidate.proxy_hash, success=False, reason="url_test_failed")
 
             exit_ip = await _resolve_exit_ip(socks_port=socks_port, timeout_s=min(timeout_s, 5.0))
@@ -130,7 +149,7 @@ class ProxyProbe:
             return UrlTestResult(
                 proxy_hash=candidate.proxy_hash,
                 success=True,
-                latency_ms=latency_ms,
+                latency_ms=best_latency_ms,
                 exit_ip=exit_ip,
                 country=country,
                 city=city,
