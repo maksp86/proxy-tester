@@ -116,7 +116,7 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
     source_urls = list(config.subscription_urls)
     LOGGER.info("Loaded %s source URLs from config", len(source_urls))
 
-    fresh = collect_candidates(source_urls)
+    fresh = collect_candidates(source_urls, probe.toolchain)
     LOGGER.info("Collected fresh candidates: %s", len(fresh))
 
     skipped_dead = 0
