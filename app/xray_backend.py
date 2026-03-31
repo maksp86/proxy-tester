@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import platform
+import re
 import stat
 import subprocess
 import tempfile
@@ -11,9 +12,11 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 LOGGER = logging.getLogger(__name__)
+TCP_MAX_PORT = 65_535
+TCP_MIN_PORT = 1
 
 
 class XrayToolchain:
@@ -22,8 +25,10 @@ class XrayToolchain:
     def __init__(self, project_root: Path | None = None) -> None:
         self._project_root = project_root or Path.cwd()
         self._bin_dir = self._project_root / ".bin"
-        self._xray_path = self._bin_dir / "xray" / "xray"
-        self._converter_path = self._bin_dir / "proxyconverter" / "ProxyConverter"
+        xray_binary_name = "xray.exe" if _is_windows() else "xray"
+        converter_binary_name = "ProxyConverter.exe" if _is_windows() else "ProxyConverter"
+        self._xray_path = self._bin_dir / "xray" / xray_binary_name
+        self._converter_path = self._bin_dir / "proxyconverter" / converter_binary_name
 
     @property
     def xray_path(self) -> Path:
@@ -72,7 +77,26 @@ class XrayToolchain:
             return {}
 
         self.ensure_converter()
+        merged: dict[str, dict[str, Any] | None] = {}
+        link_batches = list(_port_limited_chunks(links, start_port))
+        if len(link_batches) > 1:
+            LOGGER.info(
+                "Converting links in %s batches due to TCP port range: links=%s start_port=%s",
+                len(link_batches),
+                len(links),
+                start_port,
+            )
 
+        for batch in link_batches:
+            batch_data = self._convert_links_batch(batch, start_port=start_port)
+            merged.update(batch_data)
+        return merged
+
+    def _convert_links_batch(
+        self,
+        links: list[str],
+        start_port: int,
+    ) -> dict[str, dict[str, Any] | None]:
         with tempfile.TemporaryDirectory(prefix="proxyconverter-") as tmpdir:
             tmp = Path(tmpdir)
             input_path = tmp / "links.json"
@@ -89,7 +113,8 @@ class XrayToolchain:
             process = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if process.returncode != 0:
                 raise RuntimeError(
-                    f"ProxyConverter failed with code {process.returncode}: {process.stderr.strip() or process.stdout.strip()}"
+                    "ProxyConverter failed with code "
+                    f"{process.returncode}: {process.stderr.strip() or process.stdout.strip()}"
                 )
 
             payload = process.stdout.strip()
@@ -171,13 +196,24 @@ def _github_release_assets(owner: str, repo: str) -> dict[str, str]:
 
 
 def _select_xray_asset(assets: dict[str, str]) -> str:
+    system = platform.system().lower()
     machine = platform.machine().lower()
-    if machine in {"x86_64", "amd64"}:
-        wanted = "Xray-linux-64.zip"
-    elif machine in {"aarch64", "arm64"}:
-        wanted = "Xray-linux-arm64-v8a.zip"
+    if system == "windows":
+        if machine in {"x86_64", "amd64"}:
+            wanted = "Xray-windows-64.zip"
+        elif machine in {"aarch64", "arm64"}:
+            wanted = "Xray-windows-arm64-v8a.zip"
+        else:
+            raise RuntimeError(f"Unsupported architecture for Xray-core on Windows: {machine}")
+    elif system in {"linux", "darwin"}:
+        if machine in {"x86_64", "amd64"}:
+            wanted = "Xray-linux-64.zip"
+        elif machine in {"aarch64", "arm64"}:
+            wanted = "Xray-linux-arm64-v8a.zip"
+        else:
+            raise RuntimeError(f"Unsupported architecture for Xray-core: {machine}")
     else:
-        raise RuntimeError(f"Unsupported architecture for Xray-core: {machine}")
+        raise RuntimeError(f"Unsupported operating system for Xray-core: {system}")
 
     if wanted not in assets:
         raise RuntimeError(f"Xray asset {wanted} not found in latest release")
@@ -185,7 +221,19 @@ def _select_xray_asset(assets: dict[str, str]) -> str:
 
 
 def _select_converter_asset(assets: dict[str, str]) -> str:
+    system = platform.system().lower()
     machine = platform.machine().lower()
+    if system == "windows":
+        if machine in {"x86_64", "amd64"}:
+            wanted = _select_asset_by_pattern(assets, r"^ProxyConverter-win-x64(?:\.exe)?$")
+        elif machine in {"aarch64", "arm64"}:
+            wanted = _select_asset_by_pattern(assets, r"^ProxyConverter-win-arm64(?:\.exe)?$")
+        else:
+            raise RuntimeError(f"Unsupported architecture for ProxyConverter on Windows: {machine}")
+        if wanted:
+            return wanted
+        raise RuntimeError("ProxyConverter Windows asset not found in latest release")
+
     if machine in {"x86_64", "amd64"}:
         wanted = "ProxyConverter-linux-x64"
     elif machine in {"aarch64", "arm64"}:
@@ -196,6 +244,23 @@ def _select_converter_asset(assets: dict[str, str]) -> str:
     if wanted not in assets:
         raise RuntimeError(f"ProxyConverter asset {wanted} not found in latest release")
     return wanted
+
+
+def _select_asset_by_pattern(assets: dict[str, str], pattern: str) -> str | None:
+    compiled = re.compile(pattern, flags=re.IGNORECASE)
+    for asset_name in assets:
+        if compiled.match(asset_name):
+            return asset_name
+    return None
+
+
+def _port_limited_chunks(links: list[str], start_port: int) -> Iterator[list[str]]:
+    if start_port < TCP_MIN_PORT or start_port > TCP_MAX_PORT:
+        raise RuntimeError(f"start_port={start_port} is outside valid range {TCP_MIN_PORT}-{TCP_MAX_PORT}")
+
+    available_ports = TCP_MAX_PORT - start_port + 1
+    for index in range(0, len(links), available_ports):
+        yield links[index : index + available_ports]
 
 
 def _download_file(url: str, destination: Path) -> None:
@@ -210,5 +275,11 @@ def _extract_zip(archive_path: Path, destination: Path) -> None:
 
 
 def _mark_executable(path: Path) -> None:
+    if _is_windows():
+        return
     mode = path.stat().st_mode
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _is_windows() -> bool:
+    return platform.system().lower() == "windows"
