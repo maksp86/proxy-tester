@@ -218,3 +218,6 @@ vendor/
 core_engine/
 python_v2ray_vendor/
 *.v2ray.log
+
+.vscode/
+.bin/

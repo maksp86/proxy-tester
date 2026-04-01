@@ -16,7 +16,7 @@ from typing import Any, Iterator
 
 LOGGER = logging.getLogger(__name__)
 TCP_MAX_PORT = 65_535
-TCP_MIN_PORT = 1
+TCP_MIN_PORT = 1000
 
 
 class XrayToolchain:
@@ -56,7 +56,8 @@ class XrayToolchain:
         archive_path.unlink(missing_ok=True)
 
         if not self._xray_path.exists():
-            raise RuntimeError(f"Xray binary not found after extraction: {self._xray_path}")
+            raise RuntimeError(
+                f"Xray binary not found after extraction: {self._xray_path}")
         _mark_executable(self._xray_path)
 
     def ensure_converter(self) -> None:
@@ -88,7 +89,8 @@ class XrayToolchain:
             )
 
         for batch in link_batches:
-            batch_data = self._convert_links_batch(batch, start_port=start_port)
+            batch_data = self._convert_links_batch(
+                batch, start_port=start_port)
             merged.update(batch_data)
         return merged
 
@@ -100,7 +102,8 @@ class XrayToolchain:
         with tempfile.TemporaryDirectory(prefix="proxyconverter-") as tmpdir:
             tmp = Path(tmpdir)
             input_path = tmp / "links.json"
-            input_path.write_text(json.dumps(links, ensure_ascii=False), encoding="utf-8")
+            input_path.write_text(json.dumps(
+                links, ensure_ascii=False), encoding="utf-8")
 
             cmd = [
                 str(self._converter_path),
@@ -110,7 +113,8 @@ class XrayToolchain:
                 "--start-port",
                 str(start_port),
             ]
-            process = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            process = subprocess.run(
+                cmd, capture_output=True, text=True, check=False)
             if process.returncode != 0:
                 raise RuntimeError(
                     "ProxyConverter failed with code "
@@ -123,7 +127,8 @@ class XrayToolchain:
 
             data = json.loads(payload)
             if not isinstance(data, dict):
-                raise RuntimeError("ProxyConverter output has unexpected format")
+                raise RuntimeError(
+                    "ProxyConverter output has unexpected format")
             return data
 
 
@@ -176,12 +181,15 @@ def _try_decode_base64(value: str) -> str | None:
 
 def _github_release_assets(owner: str, repo: str) -> dict[str, str]:
     api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
-    request = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json"})
+    request = urllib.request.Request(
+        api_url, headers={"Accept": "application/vnd.github+json"})
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            release = json.loads(response.read().decode("utf-8", errors="ignore"))
+            release = json.loads(
+                response.read().decode("utf-8", errors="ignore"))
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Unable to fetch latest release for {owner}/{repo}: {exc}") from exc
+        raise RuntimeError(
+            f"Unable to fetch latest release for {owner}/{repo}: {exc}") from exc
 
     assets = release.get("assets") or []
     mapping: dict[str, str] = {}
@@ -191,7 +199,8 @@ def _github_release_assets(owner: str, repo: str) -> dict[str, str]:
         if name and url:
             mapping[name] = url
     if not mapping:
-        raise RuntimeError(f"No downloadable assets found for {owner}/{repo} latest release")
+        raise RuntimeError(
+            f"No downloadable assets found for {owner}/{repo} latest release")
     return mapping
 
 
@@ -204,16 +213,19 @@ def _select_xray_asset(assets: dict[str, str]) -> str:
         elif machine in {"aarch64", "arm64"}:
             wanted = "Xray-windows-arm64-v8a.zip"
         else:
-            raise RuntimeError(f"Unsupported architecture for Xray-core on Windows: {machine}")
+            raise RuntimeError(
+                f"Unsupported architecture for Xray-core on Windows: {machine}")
     elif system in {"linux", "darwin"}:
         if machine in {"x86_64", "amd64"}:
             wanted = "Xray-linux-64.zip"
         elif machine in {"aarch64", "arm64"}:
             wanted = "Xray-linux-arm64-v8a.zip"
         else:
-            raise RuntimeError(f"Unsupported architecture for Xray-core: {machine}")
+            raise RuntimeError(
+                f"Unsupported architecture for Xray-core: {machine}")
     else:
-        raise RuntimeError(f"Unsupported operating system for Xray-core: {system}")
+        raise RuntimeError(
+            f"Unsupported operating system for Xray-core: {system}")
 
     if wanted not in assets:
         raise RuntimeError(f"Xray asset {wanted} not found in latest release")
@@ -225,24 +237,30 @@ def _select_converter_asset(assets: dict[str, str]) -> str:
     machine = platform.machine().lower()
     if system == "windows":
         if machine in {"x86_64", "amd64"}:
-            wanted = _select_asset_by_pattern(assets, r"^ProxyConverter-win-x64(?:\.exe)?$")
+            wanted = _select_asset_by_pattern(
+                assets, r"^ProxyConverter-win-x64(?:\.exe)?$")
         elif machine in {"aarch64", "arm64"}:
-            wanted = _select_asset_by_pattern(assets, r"^ProxyConverter-win-arm64(?:\.exe)?$")
+            wanted = _select_asset_by_pattern(
+                assets, r"^ProxyConverter-win-arm64(?:\.exe)?$")
         else:
-            raise RuntimeError(f"Unsupported architecture for ProxyConverter on Windows: {machine}")
+            raise RuntimeError(
+                f"Unsupported architecture for ProxyConverter on Windows: {machine}")
         if wanted:
             return wanted
-        raise RuntimeError("ProxyConverter Windows asset not found in latest release")
+        raise RuntimeError(
+            "ProxyConverter Windows asset not found in latest release")
 
     if machine in {"x86_64", "amd64"}:
         wanted = "ProxyConverter-linux-x64"
     elif machine in {"aarch64", "arm64"}:
         wanted = "ProxyConverter-linux-arm64"
     else:
-        raise RuntimeError(f"Unsupported architecture for ProxyConverter: {machine}")
+        raise RuntimeError(
+            f"Unsupported architecture for ProxyConverter: {machine}")
 
     if wanted not in assets:
-        raise RuntimeError(f"ProxyConverter asset {wanted} not found in latest release")
+        raise RuntimeError(
+            f"ProxyConverter asset {wanted} not found in latest release")
     return wanted
 
 
@@ -256,11 +274,12 @@ def _select_asset_by_pattern(assets: dict[str, str], pattern: str) -> str | None
 
 def _port_limited_chunks(links: list[str], start_port: int) -> Iterator[list[str]]:
     if start_port < TCP_MIN_PORT or start_port > TCP_MAX_PORT:
-        raise RuntimeError(f"start_port={start_port} is outside valid range {TCP_MIN_PORT}-{TCP_MAX_PORT}")
+        raise RuntimeError(
+            f"start_port={start_port} is outside valid range {TCP_MIN_PORT}-{TCP_MAX_PORT}")
 
     available_ports = TCP_MAX_PORT - start_port + 1
     for index in range(0, len(links), available_ports):
-        yield links[index : index + available_ports]
+        yield links[index:index + available_ports]
 
 
 def _download_file(url: str, destination: Path) -> None:
