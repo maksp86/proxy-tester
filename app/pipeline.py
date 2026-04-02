@@ -30,13 +30,13 @@ def _chunks(items: Sequence[T], n: int) -> Iterator[Sequence[T]]:
     """
 
     for i in range(0, len(items), n):
-        yield items[i : i + n]
+        yield items[i: i + n]
 
 
 async def _run_url_tests(
     probe: ProxyProbe,
     candidates: list[CandidateProxy],
-    urls: tuple[str, ...],
+    test_url: str,
     timeout_s: float,
     attempts: int,
     batch_size: int,
@@ -49,12 +49,13 @@ async def _run_url_tests(
         LOGGER.info("URL batch %s started (size=%s)", index, len(batch))
         batch_results = await probe.url_test_batch(
             list(batch),
-            urls=urls,
-            timeout_s=timeout_s,
-            attempts=attempts,
+            test_url,
+            timeout_s,
+            attempts,
         )
         ok_count = sum(1 for item in batch_results if item.success)
-        LOGGER.info("URL batch %s finished: ok=%s fail=%s", index, ok_count, len(batch_results) - ok_count)
+        LOGGER.info("URL batch %s finished: ok=%s fail=%s", index,
+                    ok_count, len(batch_results) - ok_count)
         results.extend(batch_results)
     return results
 
@@ -63,7 +64,9 @@ async def _run_speed_tests(
     probe: ProxyProbe,
     candidates: list[CandidateProxy],
     download_url: str,
-    timeout_s: float,
+    connect_timeout_s: float,
+    download_timeout_s: float,
+    attempts: int,
     batch_size: int,
 ) -> list[SpeedTestResult]:
     """Execute speed tests by batches with detailed logs and progress bar."""
@@ -74,11 +77,14 @@ async def _run_speed_tests(
         LOGGER.info("Speed batch %s started (size=%s)", index, len(batch))
         batch_results = await probe.speed_test_batch(
             list(batch),
-            download_url=download_url,
-            timeout_s=timeout_s,
+            download_url,
+            connect_timeout_s,
+            download_timeout_s,
+            attempts
         )
         ok_count = sum(1 for item in batch_results if item.success)
-        LOGGER.info("Speed batch %s finished: ok=%s fail=%s", index, ok_count, len(batch_results) - ok_count)
+        LOGGER.info("Speed batch %s finished: ok=%s fail=%s",
+                    index, ok_count, len(batch_results) - ok_count)
         results.extend(batch_results)
     return results
 
@@ -132,7 +138,8 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
             continue
         db.upsert_proxy(c.proxy_hash, c.raw_link, c.scheme)
         seeded[c.proxy_hash] = c
-    LOGGER.info("Added fresh alive candidates: %s (skipped dead=%s)", len(seeded), skipped_dead)
+    LOGGER.info("Added fresh alive candidates: %s (skipped dead=%s)",
+                len(seeded), skipped_dead)
 
     candidates = list(seeded.values())
     if not candidates:
@@ -142,13 +149,15 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
         return []
 
     # 3) URL test stage.
-    LOGGER.info("Starting URL test stage. total_candidates=%s", len(candidates))
+    LOGGER.info("Starting URL test stage. total_candidates=%s",
+                len(candidates))
+
     url_results = await _run_url_tests(
         probe,
         candidates,
-        config.url_urls,
+        config.url_test_url,
         config.url_timeout_seconds,
-        config.url_test_attempts,
+        config.test_attempts,
         config.url_batch_size,
     )
 
@@ -165,7 +174,8 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
             details_json=json.dumps(asdict(res), ensure_ascii=False),
         )
         if not res.success:
-            db.mark_dead(res.proxy_hash, reason=res.reason or "url_test_failed", ttl_days=config.dead_ttl_days)
+            db.mark_dead(res.proxy_hash, reason=res.reason or "url_test_failed",
+                         ttl_days=config.dead_ttl_days)
             continue
 
         c = by_hash[res.proxy_hash]
@@ -179,7 +189,8 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
                 "city": res.city,
             }
         )
-    LOGGER.info("URL stage complete: ok=%s fail=%s", len(ok_for_speed), len(url_results) - len(ok_for_speed))
+    LOGGER.info("URL stage complete: ok=%s fail=%s", len(
+        ok_for_speed), len(url_results) - len(ok_for_speed))
 
     ok_for_speed.sort(key=lambda x: x.get("latency_ms") or 10**9)
     top_for_speed = ok_for_speed[: config.speed_top_n]
@@ -187,14 +198,17 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
 
     # 4) Speed test stage for top latency subset.
     speed_candidates = [
-        CandidateProxy(proxy_hash=x["proxy_hash"], raw_link=x["raw_link"], scheme="selected")
+        CandidateProxy(proxy_hash=x["proxy_hash"],
+                       raw_link=x["raw_link"], scheme="selected")
         for x in top_for_speed
     ]
     speed_results = await _run_speed_tests(
         probe,
         speed_candidates,
         config.speed_test_url,
+        config.url_timeout_seconds,
         config.speed_timeout_seconds,
+        config.test_attempts,
         config.speed_batch_size,
     )
 
@@ -215,11 +229,13 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
             details_json=json.dumps(asdict(s), ensure_ascii=False),
         )
         if not s.success:
-            db.mark_dead(s.proxy_hash, reason=s.reason or "speed_test_failed", ttl_days=config.dead_ttl_days)
+            db.mark_dead(s.proxy_hash, reason=s.reason or "speed_test_failed",
+                         ttl_days=config.dead_ttl_days)
             rejected_after_speed.add(s.proxy_hash)
             continue
         if (s.mbps or 0.0) < config.speed_min_mb_s:
-            db.mark_dead(s.proxy_hash, reason="below_speed_threshold", ttl_days=config.dead_ttl_days)
+            db.mark_dead(s.proxy_hash, reason="below_speed_threshold",
+                         ttl_days=config.dead_ttl_days)
             rejected_after_speed.add(s.proxy_hash)
             continue
         row["mbps"] = s.mbps

@@ -41,21 +41,15 @@ class AppConfig:
     # URL test settings
     url_batch_size: int = 20
     url_timeout_seconds: float = 1.0
-    url_test_attempts: int = 1
-    url_urls: tuple[str, ...] = (
-        "https://www.gstatic.com/generate_204",
-        "https://www.youtube.com/generate_204",
-        "https://x.com",
-    )
+    test_attempts: int = 1
+    url_test_url: str = "https://www.gstatic.com/generate_204"
 
     # Speed test settings
     speed_top_n: int = 100
     speed_batch_size: int = 5
     speed_timeout_seconds: float = 10.0
     speed_min_mb_s: float = 1.0
-    speed_test_url: str = (
-        "https://github.com/jamesward/play-load-tests/raw/refs/heads/master/public/10mb.txt"
-    )
+    speed_test_url: str = "https://cachefly.cachefly.net/10mb.test"
 
     # Output settings
     target_final_count: int = 25
@@ -66,7 +60,7 @@ class AppConfig:
 
 DEFAULT_CONFIG = AppConfig()
 _PATH_FIELDS = {"db_path", "export_file", "geoip_db_path"}
-_TUPLE_FIELDS = {"url_urls", "subscription_urls"}
+_TUPLE_FIELDS = {"subscription_urls"}
 
 
 def _coerce_config_value(key: str, value: Any) -> Any:
