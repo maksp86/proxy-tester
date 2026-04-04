@@ -82,6 +82,7 @@ class ProxyProbe:
         test_url: str,
         timeout_s: float,
         attempts: int = 1,
+        concurrency: int = 25,
     ) -> list[UrlTestResult]:
         if not candidates:
             return []
@@ -100,7 +101,8 @@ class ProxyProbe:
                 for c in candidates
             ]
 
-        semaphore = asyncio.Semaphore(len(candidates))
+        max_workers = max(1, min(concurrency, len(candidates)))
+        semaphore = asyncio.Semaphore(max_workers)
 
         async def _one(candidate: CandidateProxy) -> UrlTestResult:
             async with semaphore:
@@ -164,7 +166,8 @@ class ProxyProbe:
         download_url: str,
         connect_timeout_s: float,
         download_timeout_s: float,
-        attempts: int
+        attempts: int,
+        concurrency: int = 25,
     ) -> list[SpeedTestResult]:
         if not candidates:
             return []
@@ -181,7 +184,8 @@ class ProxyProbe:
                 for c in candidates
             ]
 
-        semaphore = asyncio.Semaphore(len(candidates))
+        max_workers = max(1, min(concurrency, len(candidates)))
+        semaphore = asyncio.Semaphore(max_workers)
 
         async def _one(candidate: CandidateProxy) -> SpeedTestResult:
             async with semaphore:
@@ -263,7 +267,7 @@ class _xray_runtime:
             self._proc.terminate()
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 self._proc.kill()
                 await self._proc.wait()
 
@@ -290,7 +294,7 @@ async def _resolve_exit_ip(socks_port: int, timeout_s: float) -> str | None:
         async with aiohttp.ClientSession(timeout=timeout, proxy=f"http://127.0.0.1:{socks_port}") as session:
             async with session.get("http://wtfismyip.com/text") as response:
                 return (await response.text()).strip() or None
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -310,7 +314,7 @@ async def _http_probe_speed(socks_port: int,
             async with session.get(download_url) as response:
                 async for chunk in response.content.iter_chunked(64 * 1024):
                     bytes_downloaded += len(chunk)
-    except Exception as e:
+    except Exception:
         return None, None
 
     duration = time.perf_counter() - started
