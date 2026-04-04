@@ -11,8 +11,9 @@ import tempfile
 import urllib.error
 import urllib.request
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 TCP_MAX_PORT = 65_535

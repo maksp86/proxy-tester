@@ -1,53 +1,32 @@
 # proxy-tester
 
-Nightly pipeline for collecting subscription links, filtering dead proxies, URL testing, speed testing, and exporting a final list of 25 entries with metadata comments.
+`proxy-tester` collects proxy links from subscription URLs, checks them, and exports a final ranked list.
 
-## Features implemented
+## How it works
 
-- SQLite schema and lifecycle for proxies, URL tests, speed tests, dead-list TTL, and selected final proxies.
-- Dead-list cleanup on each run.
-- Subscription loading from JSON config (`subscription_urls`).
-- Candidate parsing and deduplication via external ProxyConverter.
-- URL test + speed test orchestration with batched checks via Xray-core runtime.
-- Configurable retry count for URL tests (`url_test_attempts`), keeping the best latency per proxy.
-- Speed-test failures are excluded from final selection (no fallback with `NULL` speed for failed speed checks).
-- Progress bars for long-running stages via `tqdm`.
-- Local-file GeoIP enrichment (MaxMind `.mmdb`) for exit IP metadata.
-- Export format with comment replacement (`link # IP=... | Geo=... | URL=... | Speed=...`).
-- CLI entrypoint (`python main.py`).
+1. **Load config**  
+   Reads JSON settings (sources, limits, timeouts, output paths).
 
-## Run
+2. **Collect candidates**  
+   Downloads subscription payloads, normalizes links, removes fragments after `#`, validates links via ProxyConverter, and deduplicates by SHA256 hash.
 
-```bash
-pip install -r requirements.txt
-cp config.json.example config.json
-python main.py --config config.json --verbose
-```
+3. **Prepare pool**  
+   Seeds candidates from recent successful records and fresh subscriptions, skipping proxies currently present in the dead list (`dead_proxies`) until TTL expiration.
 
-## GeoIP database
+4. **URL test stage**  
+   Runs rolling-concurrency URL checks through Xray local inbounds. For each proxy, stores the latest status/latency/geo metadata in `proxies`.
 
-Configure path in `AppConfig.geoip_db_path`. If `AppConfig.geoip_db_url` is set, the `.mmdb` file is downloaded at startup to that path. During tests and lookups only the local file path is used.
+5. **Speed test stage**  
+   Selects the best latency subset (`speed_top_n`) and runs rolling-concurrency download speed checks. Proxies that fail speed checks or threshold filters are moved to `dead_proxies`.
 
-## Scheduler
+6. **Final selection and export**  
+   Keeps only proxies that passed speed requirements, limits to `target_final_count`, stores them in `selected_proxies`, and writes the export file.
 
-Recommended cron (once per day at 03:10):
+## Runtime model
 
-```cron
-10 3 * * * cd /path/to/repo && /usr/bin/python3 main.py --config config.json >> nightly.log 2>&1
-```
-
-## Config file
-
-Only JSON config is supported. Start from `config.json.example` and update values for your environment.
-
-
-## Runtime binaries
-
-The app downloads and uses the latest releases of:
-
-- `XTLS/Xray-core` (runtime core)
-- `maksp86/ProxyConverter` (subscription link -> Xray JSON conversion)
-
-Binaries are cached under `.bin/` in the project root.
-
-HTTP checks are executed from Python (`aiohttp`) through Xray local proxy inbounds, without external `curl`.
+- Uses SQLite (`WAL`) as persistent storage.
+- Main tables:
+  - `proxies`: current active/known proxy state
+  - `dead_proxies`: temporarily excluded proxies with TTL
+  - `selected_proxies`: last exported result set
+- URL and speed checks are executed through local Xray runtime generated from ProxyConverter configs.

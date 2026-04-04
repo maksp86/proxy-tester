@@ -14,7 +14,12 @@ LOGGER = logging.getLogger(__name__)
 def normalize_link(link: str) -> str:
     """Normalize a raw proxy link before parsing/hash."""
 
-    return link.strip()
+    clean = link.strip()
+    if not clean:
+        return clean
+    # Subscription lines often contain human-readable labels after #fragment.
+    clean = clean.split("#", 1)[0].strip()
+    return clean
 
 
 def hash_link(link: str) -> str:
@@ -50,6 +55,8 @@ def collect_candidates(source_urls: list[str], toolchain: XrayToolchain) -> list
 
         for link in links:
             clean = normalize_link(link)
+            if not clean:
+                continue
             if parsed_configs.get(clean) is None:
                 continue
 
