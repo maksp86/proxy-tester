@@ -93,7 +93,7 @@ class ProxyProbe:
 
         try:
             configs_by_link = self._toolchain.convert_links(
-                links, start_port=20000)
+                links, start_port=10000)
         except Exception as exc:
             LOGGER.exception("ProxyConverter batch conversion failed")
             return [
@@ -177,7 +177,7 @@ class ProxyProbe:
         links = [candidate.raw_link for candidate in candidates]
         try:
             configs_by_link = self._toolchain.convert_links(
-                links, start_port=30000)
+                links, start_port=10000)
         except Exception as exc:
             LOGGER.exception("ProxyConverter batch conversion failed")
             return [
@@ -198,7 +198,6 @@ class ProxyProbe:
                                                         download_timeout_s,
                                                         attempts)
 
-        # return list(await asyncio.gather(*(_one(candidate) for candidate in candidates)))
         results = await tqdm.asyncio.tqdm.gather(*(_one(candidate) for candidate in candidates))
         return results
 

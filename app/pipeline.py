@@ -82,7 +82,7 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
     LOGGER.info("Expired dead proxies cleaned: %s", cleaned)
 
     seeded: dict[str, CandidateProxy] = {}
-    for row in db.get_recent_selected(config.target_final_count):
+    for row in db.get_recent_all(config.target_final_count):
         c = _row_to_candidate(row)
         seeded[c.proxy_hash] = c
     LOGGER.info("Seeded from recent selected: %s", len(seeded))

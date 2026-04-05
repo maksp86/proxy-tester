@@ -25,15 +25,14 @@ def normalize_link(link: str) -> str:
 
 def hash_link(link: str) -> str:
     """Create stable SHA256 identifier for a proxy link."""
-
-    normalized = normalize_link(link)
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return hashlib.sha256(link.encode("utf-8")).hexdigest()
 
 
 def collect_candidates(source_urls: list[str], db: Database, toolchain: XrayToolchain) -> list[CandidateProxy]:
     """Fetch and parse candidates from all configured subscriptions."""
 
     out: list[CandidateProxy] = []
+    total_links = 0
     seen: set[str] = set()
 
     for url in tqdm(source_urls, desc="Fetch subscriptions", unit="source"):
@@ -46,7 +45,8 @@ def collect_candidates(source_urls: list[str], db: Database, toolchain: XrayTool
 
         db_subscription = db.get_subscription(url)
         if db_subscription is not None and db_subscription.last_data_hash == subscription.last_data_hash:
-            LOGGER.debug("Subscription %s did not changed since last time, skipping", url)
+            LOGGER.debug(
+                "Subscription %s did not changed since last time, skipping", url)
             continue
         db.upsert_subscription(subscription)
 
@@ -54,29 +54,36 @@ def collect_candidates(source_urls: list[str], db: Database, toolchain: XrayTool
         if not links:
             continue
 
+        clean_links = []
+        for link in links:
+            clean = normalize_link(link)
+            if not clean:
+                continue
+            total_links += 1
+            clean_links.append(clean)
+
         try:
-            parsed_configs = toolchain.convert_links(links, start_port=1000)
+            parsed_configs = toolchain.convert_links(
+                clean_links, start_port=1000)
         except Exception:
             LOGGER.exception(
                 "Failed to parse links with ProxyConverter: %s", url)
             continue
 
-        for link in links:
-            clean = normalize_link(link)
-            if not clean:
-                continue
-            if parsed_configs.get(clean) is None:
+        for link in clean_links:
+            parsed_config = parsed_configs.get(link)
+            if parsed_config is None:
                 continue
 
-            digest = hash_link(clean)
+            digest = hash_link(link)
             if digest in seen:
                 continue
 
-            scheme = clean.split(
-                "://", 1)[0].lower() if "://" in clean else "unknown"
+            scheme = parsed_config["outbounds"][0]["protocol"]
             seen.add(digest)
             out.append(CandidateProxy(proxy_hash=digest,
-                       raw_link=clean, scheme=scheme))
+                       raw_link=link, scheme=scheme))
 
-    LOGGER.info("Collected deduplicated candidates: %s", len(out))
+    LOGGER.info("Collected deduplicated candidates: %s, total: %s",
+                len(out), total_links)
     return out

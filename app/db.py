@@ -144,19 +144,29 @@ class Database:
 
         unique_hashes = list(dict.fromkeys(proxy_hashes))
         now_iso = utc_now().isoformat()
-        placeholders = ",".join("?" for _ in unique_hashes)
+
         with self.connect() as conn:
+            conn.execute("DROP TABLE IF EXISTS temp_hashes")
+            conn.execute("CREATE TEMP TABLE temp_hashes (proxy_hash TEXT)")
+
+            conn.executemany(
+                "INSERT INTO temp_hashes (proxy_hash) VALUES (?)",
+                [(proxy_hash,) for proxy_hash in unique_hashes]
+            )
+
             rows = conn.execute(
-                f"""
+                """
                 SELECT d.proxy_hash
                 FROM dead_proxies d
-                WHERE d.proxy_hash IN ({placeholders})
-                  AND d.expires_at > ?
+                INNER JOIN temp_hashes t ON d.proxy_hash = t.proxy_hash
+                WHERE d.expires_at > ?
                 """,
-                [*unique_hashes, now_iso],
+                (now_iso,),
             ).fetchall()
 
-        dead_hashes = {row["proxy_hash"] for row in rows}
+            dead_hashes = {row["proxy_hash"] for row in rows}
+
+        # Возвращаем живые хеши
         return {proxy_hash for proxy_hash in unique_hashes if proxy_hash not in dead_hashes}
 
     def mark_dead(self, proxy_hash: str, reason: str, ttl_days: int) -> None:
@@ -304,6 +314,22 @@ class Database:
                 LIMIT ?
                 """,
                 (limit,),
+            ).fetchall()
+
+    def get_recent_all(self, limit: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT
+                  p.proxy_hash,
+                  p.raw_link,
+                  p.latency_ms,
+                  p.exit_ip,
+                  p.country,
+                  p.city
+                FROM proxies p
+                ORDER BY p.latency_ms ASC, p.last_checked_at DESC
+                """
             ).fetchall()
 
     def store_selected(self, rows: list[dict]) -> None:
