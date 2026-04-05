@@ -8,6 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import tqdm.asyncio
 import aiohttp
 import geoip2.database
 from geoip2.errors import AddressNotFoundError
@@ -114,7 +115,8 @@ class ProxyProbe:
                     attempts=max(1, attempts),
                 )
 
-        return list(await asyncio.gather(*(_one(candidate) for candidate in candidates)))
+        results = await tqdm.asyncio.tqdm.gather(*(_one(candidate) for candidate in candidates))
+        return results
 
     async def _url_test_candidate(
         self,
@@ -196,7 +198,9 @@ class ProxyProbe:
                                                         download_timeout_s,
                                                         attempts)
 
-        return list(await asyncio.gather(*(_one(candidate) for candidate in candidates)))
+        # return list(await asyncio.gather(*(_one(candidate) for candidate in candidates)))
+        results = await tqdm.asyncio.tqdm.gather(*(_one(candidate) for candidate in candidates))
+        return results
 
     async def _speed_test_candidate(
         self,
@@ -305,14 +309,15 @@ async def _http_probe_speed(socks_port: int,
     connect_timeout_s = max(connect_timeout_s, 1.0)
     timeout = aiohttp.ClientTimeout(connect=max(connect_timeout_s, 1.0),
                                     sock_connect=max(connect_timeout_s, 1.0),
-                                    sock_read=max(download_timeout_s, 1.0))
+                                    sock_read=max(download_timeout_s, 1.0),
+                                    total=connect_timeout_s*2+download_timeout_s)
     bytes_downloaded = 0
     started = time.perf_counter()
 
     try:
         async with aiohttp.ClientSession(timeout=timeout, proxy=f"http://127.0.0.1:{socks_port}") as session:
             async with session.get(download_url) as response:
-                async for chunk in response.content.iter_chunked(64 * 1024):
+                async for chunk in response.content.iter_chunked(8 * 1024):
                     bytes_downloaded += len(chunk)
     except Exception:
         return None, None

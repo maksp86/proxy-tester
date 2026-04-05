@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import datetime
 
 
 @dataclass(slots=True)
@@ -20,6 +21,10 @@ class UrlTestResult:
     city: str | None = None
     reason: str | None = None
 
+@dataclass(slots=True)
+class Subscripton:
+    link: str
+    last_data_hash: str
 
 @dataclass(slots=True)
 class SpeedTestResult:

@@ -4,8 +4,9 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from .models import UrlTestResult, Subscripton
 
 
 @dataclass
@@ -17,7 +18,7 @@ class ProxyRecord:
 
 
 def utc_now() -> datetime:
-    return datetime.now(datetime.UTC)
+    return datetime.now(timezone.utc)
 
 
 class Database:
@@ -88,6 +89,11 @@ class Database:
                         country TEXT,
                         city TEXT
                     ) WITHOUT ROWID;
+
+                    CREATE TABLE IF NOT EXISTS subscriptions (
+                        link TEXT PRIMARY KEY,
+                        last_data_hash TEXT NOT NULL
+                    ) WITHOUT ROWID;
                     """
                 )
 
@@ -119,7 +125,8 @@ class Database:
                         scheme = excluded.scheme,
                         last_seen_at = excluded.last_seen_at
                     """,
-                    [(h, link, sch, now_iso, now_iso) for h, link, sch in rows],
+                    [(h, link, sch, now_iso, now_iso)
+                     for h, link, sch in rows],
                 )
 
     def is_dead(self, proxy_hash: str) -> bool:
@@ -154,7 +161,6 @@ class Database:
 
     def mark_dead(self, proxy_hash: str, reason: str, ttl_days: int) -> None:
         self.mark_dead_many([(proxy_hash, reason)], ttl_days=ttl_days)
-
 
     def mark_dead_many(self, rows: list[tuple[str, str]], ttl_days: int) -> None:
         if not rows:
@@ -212,7 +218,7 @@ class Database:
     ) -> tuple[str, str]:
         return by_hash.get(proxy_hash, ("", "unknown"))
 
-    def mark_url_results(self, rows: list[dict]) -> None:
+    def mark_url_results(self, rows: list[UrlTestResult]) -> None:
         if not rows:
             return
         now_iso = utc_now().isoformat()
@@ -233,12 +239,12 @@ class Database:
                     [
                         (
                             now_iso,
-                            "url_ok" if row["success"] else "dead",
-                            row.get("latency_ms"),
-                            row.get("exit_ip"),
-                            row.get("country"),
-                            row.get("city"),
-                            row["proxy_hash"],
+                            "url_ok" if row.success else "dead",
+                            row.latency_ms,
+                            row.exit_ip,
+                            row.country,
+                            row.city,
+                            row.proxy_hash,
                         )
                         for row in rows
                     ],
@@ -324,4 +330,35 @@ class Database:
                         )
                         for r in rows
                     ],
+                )
+
+    def get_subscription(self, link: str) -> Subscripton | None:
+        if not link:
+            return None
+        with self._write_lock:
+            with self.connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT link, last_data_hash FROM subscriptions
+                    WHERE link = ?
+                    """,
+                    (link,)
+                ).fetchone()
+                if row is not None:
+                    return Subscripton(row["link"], row["last_data_hash"])
+
+    def upsert_subscription(self, subscription: Subscripton) -> None:
+        if not subscription:
+            return
+        with self._write_lock:
+            with self.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO subscriptions(link, last_data_hash)
+                    VALUES (?, ?)
+                    ON CONFLICT(link) DO UPDATE SET
+                        link = excluded.link,
+                        last_data_hash = excluded.last_data_hash
+                    """,
+                    (subscription.link, subscription.last_data_hash)
                 )

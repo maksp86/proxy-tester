@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   proxy-tester:
     build: .
@@ -8,4 +6,6 @@ services:
     volumes:
       - ./config.json:/app/config.json:ro
       - ./geoip:/app/geoip
+      - ./proxy_pool.sqlite3:/app/proxy_pool.sqlite3
+      - ./result.txt:/app/result.txt
     command: ["python", "main.py", "--config", "config.json", "--verbose"]

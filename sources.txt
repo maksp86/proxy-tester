@@ -1,3 +1,0 @@
-# Put one subscription URL per line.
-# https://example.com/subscription1
-# https://example.com/subscription2

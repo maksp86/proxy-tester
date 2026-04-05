@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
@@ -9,6 +9,6 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
-COPY main.py README.md config.json.example ./
+COPY main.py ./
 
 CMD ["python", "main.py", "--config", "config.json", "--verbose"]

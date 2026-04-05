@@ -95,7 +95,7 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
     source_urls = list(config.subscription_urls)
     LOGGER.info("Loaded %s source URLs from config", len(source_urls))
 
-    fresh = collect_candidates(source_urls, probe.toolchain)
+    fresh = collect_candidates(source_urls, db, probe.toolchain)
     LOGGER.info("Collected fresh candidates: %s", len(fresh))
 
     fresh_by_hash = {item.proxy_hash: item for item in fresh}
@@ -129,7 +129,7 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
 
     by_hash = {c.proxy_hash: c for c in candidates}
 
-    db.mark_url_results([asdict(item) for item in url_results])
+    db.mark_url_results(url_results)
     ok_for_speed, dead_after_url = _collect_url_stage_rows(url_results, by_hash)
     db.mark_dead_many(dead_after_url, ttl_days=config.dead_ttl_days)
     LOGGER.info("URL stage complete: ok=%s fail=%s", len(ok_for_speed), len(url_results) - len(ok_for_speed))

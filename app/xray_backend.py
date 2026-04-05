@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import datetime
+import hashlib
 import json
 import logging
 import platform
@@ -14,6 +16,8 @@ import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+
+from .models import Subscripton
 
 LOGGER = logging.getLogger(__name__)
 TCP_MAX_PORT = 65_535
@@ -133,7 +137,7 @@ class XrayToolchain:
             return data
 
 
-def fetch_subscription_links(url: str, timeout: float = 10.0) -> list[str]:
+def fetch_subscription_links(url: str, timeout: float = 10.0) -> tuple[list[str], Subscripton]:
     request = urllib.request.Request(
         url,
         headers={
@@ -142,16 +146,21 @@ def fetch_subscription_links(url: str, timeout: float = 10.0) -> list[str]:
         },
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        raw = response.read().decode("utf-8", errors="ignore")
+        raw = response.read()
 
-    lines = _split_links(raw)
+    subsctiption_hash = hashlib.sha256(raw).hexdigest()
+
+    subscripton = Subscripton(url,
+                              subsctiption_hash)
+    content = raw.decode("utf-8", errors="ignore")
+    lines = _split_links(content)
     if lines:
-        return lines
+        return lines, subscripton
 
-    decoded = _try_decode_base64(raw)
+    decoded = _try_decode_base64(content)
     if decoded:
         lines = _split_links(decoded)
-    return lines
+    return lines, subscripton
 
 
 def _split_links(payload: str) -> list[str]:
