@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import heapq
+import itertools
 from dataclasses import asdict
 
 from tqdm import tqdm
@@ -21,7 +23,7 @@ def _row_to_candidate(row) -> CandidateProxy:
 
 def _collect_url_stage_rows(
     url_results,
-    by_hash: dict[str, CandidateProxy],
+    by_hash_link: dict[str, str],
 ) -> tuple[list[dict], list[tuple[str, str]]]:
     ok_for_speed: list[dict] = []
     dead_after_url: list[tuple[str, str]] = []
@@ -31,11 +33,14 @@ def _collect_url_stage_rows(
             dead_after_url.append((res.proxy_hash, res.reason or "url_test_failed"))
             continue
 
-        candidate = by_hash[res.proxy_hash]
+        raw_link = by_hash_link.get(res.proxy_hash)
+        if raw_link is None:
+            continue
+
         ok_for_speed.append(
             {
                 "proxy_hash": res.proxy_hash,
-                "raw_link": candidate.raw_link,
+                "raw_link": raw_link,
                 "latency_ms": res.latency_ms,
                 "exit_ip": res.exit_ip,
                 "country": res.country,
@@ -44,6 +49,30 @@ def _collect_url_stage_rows(
         )
 
     return ok_for_speed, dead_after_url
+
+
+def _chunked_candidates(candidates: list[CandidateProxy], chunk_size: int):
+    for index in range(0, len(candidates), chunk_size):
+        yield candidates[index:index + chunk_size]
+
+
+def _latency_value(value: float | None) -> float:
+    return value if value is not None else 10**9
+
+
+def _add_top_latency_row(
+    top_rows_heap: list[tuple[float, int, dict]],
+    row: dict,
+    limit: int,
+    counter: itertools.count,
+) -> None:
+    if limit <= 0:
+        return
+
+    score = _latency_value(row.get("latency_ms"))
+    heapq.heappush(top_rows_heap, (-score, next(counter), row))
+    if len(top_rows_heap) > limit:
+        heapq.heappop(top_rows_heap)
 
 
 def _collect_speed_stage_rows(
@@ -122,23 +151,61 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
         return []
 
     LOGGER.info("Starting URL test stage. total_candidates=%s", len(candidates))
-    url_results = await probe.url_test_batch(
-        candidates,
-        config.url_test_url,
-        config.url_timeout_seconds,
-        config.test_attempts,
-        config.url_batch_size,
-    )
+    url_stream_chunk_size = max(config.url_batch_size * 4, config.url_batch_size)
+    top_for_speed_heap: list[tuple[float, int, dict]] = []
+    heap_counter = itertools.count()
+    dead_after_url: list[tuple[str, str]] = []
+    dead_flush_size = 1000
+    total_url_ok = 0
+    total_url_fail = 0
 
-    by_hash = {c.proxy_hash: c for c in candidates}
+    for candidate_chunk in _chunked_candidates(candidates, url_stream_chunk_size):
+        url_results = await probe.url_test_batch(
+            candidate_chunk,
+            config.url_test_url,
+            config.url_timeout_seconds,
+            config.test_attempts,
+            config.url_batch_size,
+        )
+        db.mark_url_results(url_results)
 
-    db.mark_url_results(url_results)
-    ok_for_speed, dead_after_url = _collect_url_stage_rows(url_results, by_hash)
-    db.mark_dead_many(dead_after_url, ttl_days=config.dead_ttl_days)
-    LOGGER.info("URL stage complete: ok=%s fail=%s", len(ok_for_speed), len(url_results) - len(ok_for_speed))
+        by_hash_link = {candidate.proxy_hash: candidate.raw_link for candidate in candidate_chunk}
+        for res in url_results:
+            if len(dead_after_url) >= dead_flush_size:
+                db.mark_dead_many(dead_after_url, ttl_days=config.dead_ttl_days)
+                dead_after_url.clear()
 
-    ok_for_speed.sort(key=lambda x: x.get("latency_ms") or 10**9)
-    top_for_speed = ok_for_speed[: config.speed_top_n]
+            if not res.success:
+                total_url_fail += 1
+                dead_after_url.append((res.proxy_hash, res.reason or "url_test_failed"))
+                continue
+
+            raw_link = by_hash_link.get(res.proxy_hash)
+            if raw_link is None:
+                continue
+
+            total_url_ok += 1
+            _add_top_latency_row(
+                top_for_speed_heap,
+                {
+                    "proxy_hash": res.proxy_hash,
+                    "raw_link": raw_link,
+                    "latency_ms": res.latency_ms,
+                    "exit_ip": res.exit_ip,
+                    "country": res.country,
+                    "city": res.city,
+                },
+                config.speed_top_n,
+                heap_counter,
+            )
+
+
+    if dead_after_url:
+        db.mark_dead_many(dead_after_url, ttl_days=config.dead_ttl_days)
+
+    LOGGER.info("URL stage complete: ok=%s fail=%s", total_url_ok, total_url_fail)
+
+    top_for_speed = [entry[2] for entry in sorted(top_for_speed_heap, key=lambda x: -x[0])]
     LOGGER.info("Selected for speed stage: %s", len(top_for_speed))
 
     speed_candidates = [

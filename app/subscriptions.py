@@ -106,7 +106,7 @@ async def _process_source(url: str,
             return [], total_links
 
         try:
-            parsed_configs = await toolchain.convert_links(clean_links, start_port=1000)
+            parsed_configs = await toolchain.convert_links(clean_links)
         except Exception:
             LOGGER.exception(
                 "Failed to parse links with ProxyConverter: %s", url)

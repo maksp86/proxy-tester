@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import ipaddress
 import json
 import logging
@@ -17,6 +18,7 @@ from .models import CandidateProxy, SpeedTestResult, UrlTestResult
 from .xray_backend import XrayToolchain
 
 LOGGER = logging.getLogger(__name__)
+PORT_POOL_START = 20_000
 
 
 class ProxyProbe:
@@ -89,33 +91,51 @@ class ProxyProbe:
             return []
 
         ping_url = test_url if test_url else "http://www.google.com/generate_204"
-        links = [candidate.raw_link for candidate in candidates]
-
-        try:
-            configs_by_link = await self._toolchain.convert_links(
-                links, start_port=10000)
-        except Exception as exc:
-            LOGGER.exception("ProxyConverter batch conversion failed")
-            return [
-                UrlTestResult(proxy_hash=c.proxy_hash, success=False,
-                              reason=f"converter_runtime_error:{exc}")
-                for c in candidates
-            ]
-
         max_workers = max(1, min(concurrency, len(candidates)))
-        semaphore = asyncio.Semaphore(max_workers)
+        conversion_chunk_size = max(max_workers * 4, max_workers)
 
-        async def _one(candidate: CandidateProxy) -> UrlTestResult:
-            async with semaphore:
-                return await self._url_test_candidate(
-                    candidate,
-                    configs_by_link,
-                    ping_url,
-                    timeout_s,
-                    attempts=max(1, attempts),
+        results: list[UrlTestResult] = []
+        for candidate_chunk in _chunked(candidates, conversion_chunk_size):
+            links = [candidate.raw_link for candidate in candidate_chunk]
+            try:
+                configs_by_link = await self._toolchain.convert_links(
+                    links,
+                    chunk_size=conversion_chunk_size,
                 )
+            except Exception as exc:
+                LOGGER.exception("ProxyConverter batch conversion failed")
+                results.extend(
+                    UrlTestResult(
+                        proxy_hash=c.proxy_hash,
+                        success=False,
+                        reason=f"converter_runtime_error:{exc}",
+                    )
+                    for c in candidate_chunk
+                )
+                continue
 
-        results = await tqdm.asyncio.tqdm.gather(*(_one(candidate) for candidate in candidates))
+            semaphore = asyncio.Semaphore(max_workers)
+            port_pool = asyncio.Queue()
+            for port in range(PORT_POOL_START, PORT_POOL_START + max_workers):
+                port_pool.put_nowait(port)
+
+            async def _one(candidate: CandidateProxy) -> UrlTestResult:
+                async with semaphore:
+                    socks_port = await port_pool.get()
+                    try:
+                        return await self._url_test_candidate(
+                            candidate,
+                            configs_by_link,
+                            ping_url,
+                            timeout_s,
+                            attempts=max(1, attempts),
+                            socks_port=socks_port,
+                        )
+                    finally:
+                        port_pool.put_nowait(socks_port)
+
+            chunk_results = await tqdm.asyncio.tqdm.gather(*(_one(candidate) for candidate in candidate_chunk))
+            results.extend(chunk_results)
         return results
 
     async def _url_test_candidate(
@@ -125,13 +145,14 @@ class ProxyProbe:
         test_url: str,
         timeout_s: float,
         attempts: int,
+        socks_port: int,
     ) -> UrlTestResult:
-        config = configs_by_link.get(candidate.raw_link)
-        if config is None:
+        template_config = configs_by_link.get(candidate.raw_link)
+        if template_config is None:
             return UrlTestResult(proxy_hash=candidate.proxy_hash, success=False, reason="invalid_proxy_uri")
 
-        socks_port = _extract_socks_port(config)
-        if socks_port is None:
+        config = _override_socks_port(template_config, socks_port)
+        if config is None:
             return UrlTestResult(proxy_hash=candidate.proxy_hash, success=False, reason="missing_socks_inbound")
 
         async with _xray_runtime(self._toolchain.xray_path, config, socks_port):
@@ -174,31 +195,52 @@ class ProxyProbe:
         if not candidates:
             return []
 
-        links = [candidate.raw_link for candidate in candidates]
-        try:
-            configs_by_link = self._toolchain.convert_links(
-                links, start_port=10000)
-        except Exception as exc:
-            LOGGER.exception("ProxyConverter batch conversion failed")
-            return [
-                SpeedTestResult(proxy_hash=c.proxy_hash, success=False,
-                                reason=f"converter_runtime_error:{exc}")
-                for c in candidates
-            ]
-
         max_workers = max(1, min(concurrency, len(candidates)))
-        semaphore = asyncio.Semaphore(max_workers)
+        conversion_chunk_size = max(max_workers * 4, max_workers)
 
-        async def _one(candidate: CandidateProxy) -> SpeedTestResult:
-            async with semaphore:
-                return await self._speed_test_candidate(candidate,
-                                                        configs_by_link,
-                                                        download_url,
-                                                        connect_timeout_s,
-                                                        download_timeout_s,
-                                                        attempts)
+        results: list[SpeedTestResult] = []
+        for candidate_chunk in _chunked(candidates, conversion_chunk_size):
+            links = [candidate.raw_link for candidate in candidate_chunk]
+            try:
+                configs_by_link = await self._toolchain.convert_links(
+                    links,
+                    chunk_size=conversion_chunk_size,
+                )
+            except Exception as exc:
+                LOGGER.exception("ProxyConverter batch conversion failed")
+                results.extend(
+                    SpeedTestResult(
+                        proxy_hash=c.proxy_hash,
+                        success=False,
+                        reason=f"converter_runtime_error:{exc}",
+                    )
+                    for c in candidate_chunk
+                )
+                continue
 
-        results = await tqdm.asyncio.tqdm.gather(*(_one(candidate) for candidate in candidates))
+            semaphore = asyncio.Semaphore(max_workers)
+            port_pool = asyncio.Queue()
+            for port in range(PORT_POOL_START, PORT_POOL_START + max_workers):
+                port_pool.put_nowait(port)
+
+            async def _one(candidate: CandidateProxy) -> SpeedTestResult:
+                async with semaphore:
+                    socks_port = await port_pool.get()
+                    try:
+                        return await self._speed_test_candidate(
+                            candidate,
+                            configs_by_link,
+                            download_url,
+                            connect_timeout_s,
+                            download_timeout_s,
+                            attempts,
+                            socks_port,
+                        )
+                    finally:
+                        port_pool.put_nowait(socks_port)
+
+            chunk_results = await tqdm.asyncio.tqdm.gather(*(_one(candidate) for candidate in candidate_chunk))
+            results.extend(chunk_results)
         return results
 
     async def _speed_test_candidate(
@@ -208,14 +250,15 @@ class ProxyProbe:
         download_url: str,
         connect_timeout_s: float,
         download_timeout_s: float,
-        attempts: int
+        attempts: int,
+        socks_port: int,
     ) -> SpeedTestResult:
-        config = configs_by_link.get(candidate.raw_link)
-        if config is None:
+        template_config = configs_by_link.get(candidate.raw_link)
+        if template_config is None:
             return SpeedTestResult(proxy_hash=candidate.proxy_hash, success=False, reason="invalid_proxy_uri")
 
-        socks_port = _extract_socks_port(config)
-        if socks_port is None:
+        config = _override_socks_port(template_config, socks_port)
+        if config is None:
             return SpeedTestResult(proxy_hash=candidate.proxy_hash, success=False, reason="missing_socks_inbound")
 
         async with _xray_runtime(self._toolchain.xray_path, config, socks_port):
@@ -341,3 +384,19 @@ def _extract_socks_port(config: dict) -> int | None:
         if protocol in {"socks", "mixed"} and inbound.get("port"):
             return int(inbound["port"])
     return None
+
+
+def _override_socks_port(config: dict, socks_port: int) -> dict | None:
+    cloned = copy.deepcopy(config)
+    inbounds = cloned.get("inbounds") or []
+    for inbound in inbounds:
+        protocol = (inbound.get("protocol") or "").lower()
+        if protocol in {"socks", "mixed"}:
+            inbound["port"] = socks_port
+            return cloned
+    return None
+
+
+def _chunked(values: list[CandidateProxy], chunk_size: int):
+    for index in range(0, len(values), chunk_size):
+        yield values[index:index + chunk_size]
