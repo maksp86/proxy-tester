@@ -19,8 +19,6 @@ from typing import Any
 from .models import Subscripton
 
 LOGGER = logging.getLogger(__name__)
-TCP_MAX_PORT = 65_535
-TCP_MIN_PORT = 1000
 
 
 class XrayToolchain:
@@ -80,25 +78,26 @@ class XrayToolchain:
     async def convert_links(
         self,
         links: list[str],
-        start_port: int = 10808,
+        chunk_size: int | None = None,
     ) -> dict[str, dict[str, Any] | None]:
         if not links:
             return {}
 
         self.ensure_converter()
         merged: dict[str, dict[str, Any] | None] = {}
-        link_batches = list(_port_limited_chunks(links, start_port))
+        link_batches = list(_build_link_batches(links, chunk_size))
 
         if len(link_batches) > 1:
             LOGGER.info(
-                "Converting links in %s batches due to TCP port range: links=%s start_port=%s",
+                "Converting links in %s batches: links=%s",
                 len(link_batches),
                 len(links),
-                start_port,
             )
 
         for batch in link_batches:
-            batch_data = await self._convert_links_batch(batch, start_port=start_port)
+            batch_data = await self._convert_links_batch(
+                batch,
+            )
             merged.update(batch_data)
 
         return merged
@@ -106,14 +105,10 @@ class XrayToolchain:
     async def _convert_links_batch(
         self,
         links: list[str],
-        start_port: int,
     ) -> dict[str, dict[str, Any] | None]:
         cmd = [
             str(self._converter_path),
             "--input-json=-",
-            "--change-ports",
-            "--start-port",
-            str(start_port),
         ]
 
         process = await asyncio.create_subprocess_exec(
@@ -291,14 +286,14 @@ def _select_asset_by_pattern(assets: dict[str, str], pattern: str) -> str | None
     return None
 
 
-def _port_limited_chunks(links: list[str], start_port: int) -> Iterator[list[str]]:
-    if start_port < TCP_MIN_PORT or start_port > TCP_MAX_PORT:
-        raise RuntimeError(
-            f"start_port={start_port} is outside valid range {TCP_MIN_PORT}-{TCP_MAX_PORT}")
+def _build_link_batches(
+    links: list[str],
+    chunk_size: int | None,
+) -> Iterator[list[str]]:
+    batch_size = max(1, chunk_size or len(links))
 
-    available_ports = TCP_MAX_PORT - start_port + 1
-    for index in range(0, len(links), available_ports):
-        yield links[index:index + available_ports]
+    for index in range(0, len(links), batch_size):
+        yield links[index:index + batch_size]
 
 
 def _download_file(url: str, destination: Path) -> None:
