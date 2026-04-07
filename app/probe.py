@@ -4,7 +4,7 @@ import asyncio
 import ipaddress
 import json
 import logging
-import tempfile
+import socket
 import time
 from pathlib import Path
 
@@ -92,7 +92,7 @@ class ProxyProbe:
         links = [candidate.raw_link for candidate in candidates]
 
         try:
-            configs_by_link = self._toolchain.convert_links(
+            configs_by_link = await self._toolchain.convert_links(
                 links, start_port=10000)
         except Exception as exc:
             LOGGER.exception("ProxyConverter batch conversion failed")
@@ -247,35 +247,38 @@ class _xray_runtime:
         self._xray_path = xray_path
         self._config = config
         self._socks_port = socks_port
-        self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._proc: asyncio.subprocess.Process | None = None
 
     async def __aenter__(self) -> None:
-        self._tmpdir = tempfile.TemporaryDirectory(prefix="xray-config-")
-        config_path = Path(self._tmpdir.name) / "config.json"
-        config_path.write_text(json.dumps(
-            self._config, ensure_ascii=False), encoding="utf-8")
-
         self._proc = await asyncio.create_subprocess_exec(
             str(self._xray_path),
             "run",
-            "-c",
-            str(config_path),
+            cwd=self._xray_path.parent,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
 
+        self._proc.stdin.write(json.dumps(self._config).encode("utf-8"))
+        await self._proc.stdin.drain()
+        self._proc.stdin.close()
+
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=0.5)
+        except TimeoutError:
+            return
+
+        raise ValueError(
+            f"Something is wrong with config: {self._config}. Xray at {self._socks_port} is dead with code {self._proc.returncode}.")
+
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._proc and self._proc.returncode is None:
-            self._proc.terminate()
+            self._proc.kill()
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=1.0)
             except TimeoutError:
-                self._proc.kill()
-                await self._proc.wait()
-
-        if self._tmpdir:
-            self._tmpdir.cleanup()
+                raise RuntimeError(
+                    f"Failed to kill xray at {self._socks_port}.")
 
 
 async def _http_probe_url(socks_port: int, test_url: str, timeout_s: float) -> tuple[bool, float | None]:
@@ -294,8 +297,12 @@ async def _http_probe_url(socks_port: int, test_url: str, timeout_s: float) -> t
 async def _resolve_exit_ip(socks_port: int, timeout_s: float) -> str | None:
     timeout = aiohttp.ClientTimeout(total=max(timeout_s, 1.0))
     try:
-        async with aiohttp.ClientSession(timeout=timeout, proxy=f"http://127.0.0.1:{socks_port}") as session:
-            async with session.get("http://wtfismyip.com/text") as response:
+        resolver = aiohttp.AsyncResolver(family=socket.AF_INET)
+        connector = aiohttp.TCPConnector(resolver=resolver)
+        async with aiohttp.ClientSession(timeout=timeout,
+                                         connector=connector,
+                                         proxy=f"http://127.0.0.1:{socks_port}") as session:
+            async with session.get("http://ifconfig.me/ip") as response:
                 return (await response.text()).strip() or None
     except Exception:
         return None

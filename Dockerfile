@@ -1,5 +1,11 @@
 FROM python:3.13-slim
 
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt update \
+    && apt upgrade -y --fix-missing --no-install-recommends libicu-dev \
+    && apt-get clean -y && apt-get autoremove -y && apt-get autoclean -y && rm -r /var/lib/apt/lists/
+
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

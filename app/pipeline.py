@@ -74,13 +74,7 @@ def _collect_speed_stage_rows(
 
     return final, dead_after_speed
 
-
-async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[dict]:
-    LOGGER.info("Initializing DB schema")
-    db.init_schema()
-    cleaned = db.cleanup_expired_dead()
-    LOGGER.info("Expired dead proxies cleaned: %s", cleaned)
-
+async def fetch_candidates(config: AppConfig, db: Database, probe: ProxyProbe) -> list[CandidateProxy]:
     seeded: dict[str, CandidateProxy] = {}
     for row in db.get_recent_all(config.target_final_count):
         c = _row_to_candidate(row)
@@ -95,7 +89,7 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
     source_urls = list(config.subscription_urls)
     LOGGER.info("Loaded %s source URLs from config", len(source_urls))
 
-    fresh = collect_candidates(source_urls, db, probe.toolchain)
+    fresh = await collect_candidates(source_urls, db, probe.toolchain)
     LOGGER.info("Collected fresh candidates: %s", len(fresh))
 
     fresh_by_hash = {item.proxy_hash: item for item in fresh}
@@ -111,7 +105,16 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[d
     db.upsert_proxies(upsert_rows)
     LOGGER.info("Added fresh alive candidates: %s (skipped dead=%s)", len(seeded), skipped_dead)
 
-    candidates = list(seeded.values())
+    return list(seeded.values())
+
+async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> list[dict]:
+    LOGGER.info("Initializing DB schema")
+    db.init_schema()
+    cleaned = db.cleanup_expired_dead()
+    LOGGER.info("Expired dead proxies cleaned: %s", cleaned)
+
+    candidates = await fetch_candidates(config, db, probe)
+
     if not candidates:
         LOGGER.warning("No candidates available after seeding/collecting")
         db.store_selected([])

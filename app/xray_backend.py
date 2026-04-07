@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import base64
-import datetime
 import hashlib
 import json
 import logging
 import platform
 import re
 import stat
-import subprocess
-import tempfile
+import asyncio
+import aiohttp
 import urllib.error
 import urllib.request
 import zipfile
@@ -78,13 +77,18 @@ class XrayToolchain:
         _download_file(download_url, self._converter_path)
         _mark_executable(self._converter_path)
 
-    def convert_links(self, links: list[str], start_port: int = 10808) -> dict[str, dict[str, Any] | None]:
+    async def convert_links(
+        self,
+        links: list[str],
+        start_port: int = 10808,
+    ) -> dict[str, dict[str, Any] | None]:
         if not links:
             return {}
 
         self.ensure_converter()
         merged: dict[str, dict[str, Any] | None] = {}
         link_batches = list(_port_limited_chunks(links, start_port))
+
         if len(link_batches) > 1:
             LOGGER.info(
                 "Converting links in %s batches due to TCP port range: links=%s start_port=%s",
@@ -94,73 +98,78 @@ class XrayToolchain:
             )
 
         for batch in link_batches:
-            batch_data = self._convert_links_batch(
-                batch, start_port=start_port)
+            batch_data = await self._convert_links_batch(batch, start_port=start_port)
             merged.update(batch_data)
+
         return merged
 
-    def _convert_links_batch(
+    async def _convert_links_batch(
         self,
         links: list[str],
         start_port: int,
     ) -> dict[str, dict[str, Any] | None]:
-        with tempfile.TemporaryDirectory(prefix="proxyconverter-") as tmpdir:
-            tmp = Path(tmpdir)
-            input_path = tmp / "links.json"
-            input_path.write_text(json.dumps(
-                links, ensure_ascii=False), encoding="utf-8")
+        cmd = [
+            str(self._converter_path),
+            "--input-json=-",
+            "--change-ports",
+            "--start-port",
+            str(start_port),
+        ]
 
-            cmd = [
-                str(self._converter_path),
-                "--input-json",
-                str(input_path),
-                "--change-ports",
-                "--start-port",
-                str(start_port),
-            ]
-            process = subprocess.run(
-                cmd, capture_output=True, text=True, check=False)
-            if process.returncode != 0:
-                raise RuntimeError(
-                    "ProxyConverter failed with code "
-                    f"{process.returncode}: {process.stderr.strip() or process.stdout.strip()}"
-                )
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
-            payload = process.stdout.strip()
-            if not payload:
-                raise RuntimeError("ProxyConverter returned empty output")
+        stdout, stderr = await process.communicate(
+            input=json.dumps(links).encode("utf-8")
+        )
 
-            data = json.loads(payload)
-            if not isinstance(data, dict):
-                raise RuntimeError(
-                    "ProxyConverter output has unexpected format")
-            return data
+        if process.returncode != 0:
+            raise RuntimeError(
+                "ProxyConverter failed with code "
+                f"{process.returncode}: "
+                f"{stderr.decode('utf-8', errors='ignore').strip() or stdout.decode('utf-8', errors='ignore').strip()}"
+            )
+
+        payload = stdout.decode("utf-8", errors="ignore").strip()
+        if not payload:
+            raise RuntimeError("ProxyConverter returned empty output")
+
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            raise RuntimeError("ProxyConverter output has unexpected format")
+
+        return data
 
 
-def fetch_subscription_links(url: str, timeout: float = 10.0) -> tuple[list[str], Subscripton]:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "proxy-tester/1.0",
-            "Accept": "text/plain,application/json,*/*",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        raw = response.read()
+async def fetch_subscription_links(
+    url: str,
+    timeout: float = 10.0,
+) -> tuple[list[str], Subscripton]:
+    timeout_cfg = aiohttp.ClientTimeout(total=timeout)
 
-    subsctiption_hash = hashlib.sha256(raw).hexdigest()
+    async with aiohttp.ClientSession(timeout=timeout_cfg,
+                                     headers={"Accept": "text/plain,application/json,*/*"}) as session:
+        async with session.get(url) as response:
+            response.raise_for_status()
+            raw = await response.read()
 
-    subscripton = Subscripton(url,
-                              subsctiption_hash)
+    subscription_hash = hashlib.sha256(raw).hexdigest()
+    subscription = Subscripton(url, subscription_hash)
+
     content = raw.decode("utf-8", errors="ignore")
     lines = _split_links(content)
     if lines:
-        return lines, subscripton
+        return lines, subscription
 
     decoded = _try_decode_base64(content)
     if decoded:
         lines = _split_links(decoded)
-    return lines, subscripton
+
+    return lines, subscription
 
 
 def _split_links(payload: str) -> list[str]:
