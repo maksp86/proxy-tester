@@ -50,8 +50,7 @@ class ProxyProbe:
             if not self._geoip_db_path.exists():
                 self._geoip_error = f"geoip_db_not_found:{self._geoip_db_path}"
                 return None
-            self._geoip_reader = geoip2.database.Reader(
-                str(self._geoip_db_path))
+            self._geoip_reader = geoip2.database.Reader(str(self._geoip_db_path))
             return self._geoip_reader
         except Exception as exc:
             self._geoip_error = f"geoip_reader_init_failed:{exc}"
@@ -358,8 +357,7 @@ class _xray_runtime:
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=1.0)
             except TimeoutError:
-                raise RuntimeError(
-                    f"Failed to kill xray at {self._socks_port}.")
+                raise RuntimeError(f"Failed to kill xray at {self._socks_port}.")
 
 
 async def _http_probe_url(
@@ -446,4 +444,4 @@ def _override_socks_port(config: dict, socks_port: int) -> dict | None:
 
 def _chunked(values: list[CandidateProxy], chunk_size: int):
     for index in range(0, len(values), chunk_size):
-        yield values[index: index + chunk_size]
+        yield values[index : index + chunk_size]

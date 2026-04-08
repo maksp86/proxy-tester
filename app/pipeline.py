@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from .config import AppConfig
 from .db import Database
@@ -124,6 +125,8 @@ async def _url_test_stage(
 
 
 async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> None:
+    start_time = time.perf_counter()
+
     LOGGER.info("Initializing DB schema")
     db.init_schema()
     cleaned = db.cleanup_expired_dead()
@@ -137,7 +140,9 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> None:
         write_export(config.export_file, db)
         return
 
-    LOGGER.info("Starting URL test stage. total_candidates=%s", len(candidates))
+    candidates_count = len(candidates)
+
+    LOGGER.info("Starting URL test stage. total_candidates=%s", candidates_count)
 
     top_for_speed = await _url_test_stage(config, db, probe, candidates)
 
@@ -187,11 +192,17 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> None:
             if total_speed_ok == config.target_final_count:
                 break
 
-    db.mark_dead_many(dead_after_speed, ttl_days=config.dead_ttl_days)
+    db.mark_dead_many(dead_after_speed, ttl_days=config.dead_ttl_days // 2)
 
     LOGGER.info("Final selection size: %s", len(final_selection))
     db.store_selected(final_selection)
 
-    write_export(config.export_file, db)
+    end_time = time.perf_counter()
+
+    write_export(
+        config.export_file,
+        db,
+        {"elapsed_time": end_time - start_time, "candidates": candidates_count},
+    )
     LOGGER.info("Export saved to %s", config.export_file)
     LOGGER.info("Pipeline completed.")
