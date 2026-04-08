@@ -9,3 +9,10 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 ignore = ["E501"]
+
+[tool.flake8]
+max-line-length = 184
+
+extend-ignore = ["E203", "W503"]
+
+exclude = [".git", "__pycache__", ".venv", ".vscode", ".bin", "geoip"]

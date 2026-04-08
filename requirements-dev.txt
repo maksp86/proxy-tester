@@ -1,2 +1,8 @@
 pytest
 ruff
+Flake8
+Flake8-pyproject
+mypy
+black
+isort
+types-tqdm

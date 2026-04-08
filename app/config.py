@@ -57,6 +57,8 @@ class AppConfig:
     # Dead list TTL
     dead_ttl_days: int = 30
 
+    exclude_countries: tuple[str, ...] = ()
+
 
 DEFAULT_CONFIG = AppConfig()
 _PATH_FIELDS = {"db_path", "export_file", "geoip_db_path"}

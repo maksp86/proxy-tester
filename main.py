@@ -61,8 +61,7 @@ async def _amain(verbose: bool, config_path: Path | None) -> None:
 
     db = Database(cfg.db_path)
     probe = ProxyProbe(geoip_db_path=cfg.geoip_db_path)
-    selected = await run_once(cfg, db, probe)
-    logging.info("Pipeline completed. Selected %s proxies.", len(selected))
+    await run_once(cfg, db, probe)
 
 
 def main() -> None:

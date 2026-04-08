@@ -8,10 +8,11 @@ import logging
 import socket
 import time
 from pathlib import Path
+from typing import Any
 
-import tqdm.asyncio
 import aiohttp
 import geoip2.database
+import tqdm.asyncio
 from geoip2.errors import AddressNotFoundError
 
 from .models import CandidateProxy, SpeedTestResult, UrlTestResult
@@ -24,7 +25,9 @@ PORT_POOL_START = 20_000
 class ProxyProbe:
     """Proxy probing adapter built on Xray-core + ProxyConverter."""
 
-    def __init__(self, project_root: Path | None = None, geoip_db_path: Path | None = None) -> None:
+    def __init__(
+        self, project_root: Path | None = None, geoip_db_path: Path | None = None
+    ) -> None:
         self._toolchain = XrayToolchain(project_root=project_root)
         self._geoip_db_path = geoip_db_path
         self._geoip_reader: geoip2.database.Reader | None = None
@@ -115,7 +118,7 @@ class ProxyProbe:
                 continue
 
             semaphore = asyncio.Semaphore(max_workers)
-            port_pool = asyncio.Queue()
+            port_pool: asyncio.Queue[int] = asyncio.Queue()
             for port in range(PORT_POOL_START, PORT_POOL_START + max_workers):
                 port_pool.put_nowait(port)
 
@@ -131,17 +134,25 @@ class ProxyProbe:
                             attempts=max(1, attempts),
                             socks_port=socks_port,
                         )
+                    except Exception:
+                        return UrlTestResult(
+                            proxy_hash=candidate.proxy_hash,
+                            success=False,
+                            reason="xray_runtime_error",
+                        )
                     finally:
                         port_pool.put_nowait(socks_port)
 
-            chunk_results = await tqdm.asyncio.tqdm.gather(*(_one(candidate) for candidate in candidate_chunk))
+            chunk_results = await tqdm.asyncio.tqdm.gather(
+                *(_one(candidate) for candidate in candidate_chunk)
+            )
             results.extend(chunk_results)
         return results
 
     async def _url_test_candidate(
         self,
         candidate: CandidateProxy,
-        configs_by_link: dict[str, dict],
+        configs_by_link: dict[str, dict[str, Any] | None],
         test_url: str,
         timeout_s: float,
         attempts: int,
@@ -149,11 +160,19 @@ class ProxyProbe:
     ) -> UrlTestResult:
         template_config = configs_by_link.get(candidate.raw_link)
         if template_config is None:
-            return UrlTestResult(proxy_hash=candidate.proxy_hash, success=False, reason="invalid_proxy_uri")
+            return UrlTestResult(
+                proxy_hash=candidate.proxy_hash,
+                success=False,
+                reason="invalid_proxy_uri",
+            )
 
         config = _override_socks_port(template_config, socks_port)
         if config is None:
-            return UrlTestResult(proxy_hash=candidate.proxy_hash, success=False, reason="missing_socks_inbound")
+            return UrlTestResult(
+                proxy_hash=candidate.proxy_hash,
+                success=False,
+                reason="missing_socks_inbound",
+            )
 
         async with _xray_runtime(self._toolchain.xray_path, config, socks_port):
             latency_ms: float | None = None
@@ -170,9 +189,15 @@ class ProxyProbe:
                     latency_ms = latency_result
 
             if latency_ms is None:
-                return UrlTestResult(proxy_hash=candidate.proxy_hash, success=False, reason="url_test_failed")
+                return UrlTestResult(
+                    proxy_hash=candidate.proxy_hash,
+                    success=False,
+                    reason="url_test_failed",
+                )
 
-            exit_ip = await _resolve_exit_ip(socks_port=socks_port, timeout_s=min(timeout_s, 5.0))
+            exit_ip = await _resolve_exit_ip(
+                socks_port=socks_port, timeout_s=min(timeout_s, 5.0)
+            )
             country, city = self._geoip_lookup(exit_ip)
             return UrlTestResult(
                 proxy_hash=candidate.proxy_hash,
@@ -219,7 +244,7 @@ class ProxyProbe:
                 continue
 
             semaphore = asyncio.Semaphore(max_workers)
-            port_pool = asyncio.Queue()
+            port_pool: asyncio.Queue[int] = asyncio.Queue()
             for port in range(PORT_POOL_START, PORT_POOL_START + max_workers):
                 port_pool.put_nowait(port)
 
@@ -239,14 +264,16 @@ class ProxyProbe:
                     finally:
                         port_pool.put_nowait(socks_port)
 
-            chunk_results = await tqdm.asyncio.tqdm.gather(*(_one(candidate) for candidate in candidate_chunk))
+            chunk_results = await tqdm.asyncio.tqdm.gather(
+                *(_one(candidate) for candidate in candidate_chunk)
+            )
             results.extend(chunk_results)
         return results
 
     async def _speed_test_candidate(
         self,
         candidate: CandidateProxy,
-        configs_by_link: dict[str, dict],
+        configs_by_link: dict[str, dict[str, Any] | None],
         download_url: str,
         connect_timeout_s: float,
         download_timeout_s: float,
@@ -255,26 +282,35 @@ class ProxyProbe:
     ) -> SpeedTestResult:
         template_config = configs_by_link.get(candidate.raw_link)
         if template_config is None:
-            return SpeedTestResult(proxy_hash=candidate.proxy_hash, success=False, reason="invalid_proxy_uri")
+            return SpeedTestResult(
+                proxy_hash=candidate.proxy_hash,
+                success=False,
+                reason="invalid_proxy_uri",
+            )
 
         config = _override_socks_port(template_config, socks_port)
         if config is None:
-            return SpeedTestResult(proxy_hash=candidate.proxy_hash, success=False, reason="missing_socks_inbound")
+            return SpeedTestResult(
+                proxy_hash=candidate.proxy_hash,
+                success=False,
+                reason="missing_socks_inbound",
+            )
 
         async with _xray_runtime(self._toolchain.xray_path, config, socks_port):
             speed_bps, size_download = None, None
             for _ in range(attempts):
                 speed_bps, size_download = await _http_probe_speed(
-                    socks_port,
-                    download_url,
-                    connect_timeout_s,
-                    download_timeout_s
+                    socks_port, download_url, connect_timeout_s, download_timeout_s
                 )
                 if speed_bps is None and size_download is None:
                     continue
 
             if speed_bps is None:
-                return SpeedTestResult(proxy_hash=candidate.proxy_hash, success=False, reason="speed_test_failed")
+                return SpeedTestResult(
+                    proxy_hash=candidate.proxy_hash,
+                    success=False,
+                    reason="speed_test_failed",
+                )
 
             mbps = speed_bps * 8 / 1_000_000
             return SpeedTestResult(
@@ -302,9 +338,10 @@ class _xray_runtime:
             stderr=asyncio.subprocess.DEVNULL,
         )
 
-        self._proc.stdin.write(json.dumps(self._config).encode("utf-8"))
-        await self._proc.stdin.drain()
-        self._proc.stdin.close()
+        if self._proc.stdin:
+            self._proc.stdin.write(json.dumps(self._config).encode("utf-8"))
+            await self._proc.stdin.drain()
+            self._proc.stdin.close()
 
         try:
             await asyncio.wait_for(self._proc.wait(), timeout=0.5)
@@ -312,7 +349,8 @@ class _xray_runtime:
             return
 
         raise ValueError(
-            f"Something is wrong with config: {self._config}. Xray at {self._socks_port} is dead with code {self._proc.returncode}.")
+            f"""Something is wrong with config: {self._config}. Xray at {self._socks_port} is dead with code {self._proc.returncode}."""
+        )
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._proc and self._proc.returncode is None:
@@ -324,11 +362,15 @@ class _xray_runtime:
                     f"Failed to kill xray at {self._socks_port}.")
 
 
-async def _http_probe_url(socks_port: int, test_url: str, timeout_s: float) -> tuple[bool, float | None]:
+async def _http_probe_url(
+    socks_port: int, test_url: str, timeout_s: float
+) -> tuple[bool, float | None]:
     timeout = aiohttp.ClientTimeout(total=max(timeout_s, 1.0))
     start = time.perf_counter()
     try:
-        async with aiohttp.ClientSession(timeout=timeout, proxy=f"http://127.0.0.1:{socks_port}") as session:
+        async with aiohttp.ClientSession(
+            timeout=timeout, proxy=f"http://127.0.0.1:{socks_port}"
+        ) as session:
             async with session.get(test_url) as response:
                 await response.read()
         latency_ms = (time.perf_counter() - start) * 1000
@@ -340,31 +382,36 @@ async def _http_probe_url(socks_port: int, test_url: str, timeout_s: float) -> t
 async def _resolve_exit_ip(socks_port: int, timeout_s: float) -> str | None:
     timeout = aiohttp.ClientTimeout(total=max(timeout_s, 1.0))
     try:
-        resolver = aiohttp.AsyncResolver(family=socket.AF_INET)
-        connector = aiohttp.TCPConnector(resolver=resolver)
-        async with aiohttp.ClientSession(timeout=timeout,
-                                         connector=connector,
-                                         proxy=f"http://127.0.0.1:{socks_port}") as session:
+        connector = aiohttp.TCPConnector(family=socket.AF_INET)
+        async with aiohttp.ClientSession(
+            timeout=timeout, connector=connector, proxy=f"http://127.0.0.1:{socks_port}"
+        ) as session:
             async with session.get("http://ifconfig.me/ip") as response:
                 return (await response.text()).strip() or None
     except Exception:
         return None
 
 
-async def _http_probe_speed(socks_port: int,
-                            download_url: str,
-                            connect_timeout_s: float,
-                            download_timeout_s: float) -> tuple[float | None, int | None]:
+async def _http_probe_speed(
+    socks_port: int,
+    download_url: str,
+    connect_timeout_s: float,
+    download_timeout_s: float,
+) -> tuple[float | None, int | None]:
     connect_timeout_s = max(connect_timeout_s, 1.0)
-    timeout = aiohttp.ClientTimeout(connect=max(connect_timeout_s, 1.0),
-                                    sock_connect=max(connect_timeout_s, 1.0),
-                                    sock_read=max(download_timeout_s, 1.0),
-                                    total=connect_timeout_s*2+download_timeout_s)
+    timeout = aiohttp.ClientTimeout(
+        connect=max(connect_timeout_s, 1.0),
+        sock_connect=max(connect_timeout_s, 1.0),
+        sock_read=max(download_timeout_s, 1.0),
+        total=connect_timeout_s * 2 + download_timeout_s,
+    )
     bytes_downloaded = 0
     started = time.perf_counter()
 
     try:
-        async with aiohttp.ClientSession(timeout=timeout, proxy=f"http://127.0.0.1:{socks_port}") as session:
+        async with aiohttp.ClientSession(
+            timeout=timeout, proxy=f"http://127.0.0.1:{socks_port}"
+        ) as session:
             async with session.get(download_url) as response:
                 async for chunk in response.content.iter_chunked(8 * 1024):
                     bytes_downloaded += len(chunk)
@@ -399,4 +446,4 @@ def _override_socks_port(config: dict, socks_port: int) -> dict | None:
 
 def _chunked(values: list[CandidateProxy], chunk_size: int):
     for index in range(0, len(values), chunk_size):
-        yield values[index:index + chunk_size]
+        yield values[index: index + chunk_size]

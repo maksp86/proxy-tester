@@ -1,10 +1,11 @@
+import asyncio
 import hashlib
 import logging
+
 import tqdm.asyncio
-import asyncio
 
 from .db import Database
-from .models import CandidateProxy, Subscripton
+from .models import CandidateProxy
 from .xray_backend import XrayToolchain, fetch_subscription_links
 
 LOGGER = logging.getLogger(__name__)
@@ -37,8 +38,7 @@ async def collect_candidates(
     seen: set[str] = set()
 
     batches = await tqdm.asyncio.tqdm.gather(
-        *(_process_source(url, db, toolchain, semaphore)
-          for url in source_urls),
+        *(_process_source(url, db, toolchain, semaphore) for url in source_urls),
         desc="Fetch subscriptions",
         unit="source",
     )
@@ -63,10 +63,9 @@ async def collect_candidates(
     return out
 
 
-async def _process_source(url: str,
-                          db: Database,
-                          toolchain: XrayToolchain,
-                          semaphore: asyncio.Semaphore) -> tuple[list[CandidateProxy], int]:
+async def _process_source(
+    url: str, db: Database, toolchain: XrayToolchain, semaphore: asyncio.Semaphore
+) -> tuple[list[CandidateProxy], int]:
     async with semaphore:
         LOGGER.info("Fetching subscription: %s", url)
 
@@ -108,8 +107,7 @@ async def _process_source(url: str,
         try:
             parsed_configs = await toolchain.convert_links(clean_links)
         except Exception:
-            LOGGER.exception(
-                "Failed to parse links with ProxyConverter: %s", url)
+            LOGGER.exception("Failed to parse links with ProxyConverter: %s", url)
             return [], total_links
 
         candidates: list[CandidateProxy] = []

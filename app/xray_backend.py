@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -7,14 +8,14 @@ import logging
 import platform
 import re
 import stat
-import asyncio
-import aiohttp
 import urllib.error
 import urllib.request
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+
+import aiohttp
 
 from .models import Subscripton
 
@@ -28,7 +29,9 @@ class XrayToolchain:
         self._project_root = project_root or Path.cwd()
         self._bin_dir = self._project_root / ".bin"
         xray_binary_name = "xray.exe" if _is_windows() else "xray"
-        converter_binary_name = "ProxyConverter.exe" if _is_windows() else "ProxyConverter"
+        converter_binary_name = (
+            "ProxyConverter.exe" if _is_windows() else "ProxyConverter"
+        )
         self._xray_path = self._bin_dir / "xray" / xray_binary_name
         self._converter_path = self._bin_dir / "proxyconverter" / converter_binary_name
 
@@ -59,7 +62,8 @@ class XrayToolchain:
 
         if not self._xray_path.exists():
             raise RuntimeError(
-                f"Xray binary not found after extraction: {self._xray_path}")
+                f"Xray binary not found after extraction: {self._xray_path}"
+            )
         _mark_executable(self._xray_path)
 
     def ensure_converter(self) -> None:
@@ -146,8 +150,9 @@ async def fetch_subscription_links(
 ) -> tuple[list[str], Subscripton]:
     timeout_cfg = aiohttp.ClientTimeout(total=timeout)
 
-    async with aiohttp.ClientSession(timeout=timeout_cfg,
-                                     headers={"Accept": "text/plain,application/json,*/*"}) as session:
+    async with aiohttp.ClientSession(
+        timeout=timeout_cfg, headers={"Accept": "text/plain,application/json,*/*"}
+    ) as session:
         async with session.get(url) as response:
             response.raise_for_status()
             raw = await response.read()
@@ -196,14 +201,15 @@ def _try_decode_base64(value: str) -> str | None:
 def _github_release_assets(owner: str, repo: str) -> dict[str, str]:
     api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
     request = urllib.request.Request(
-        api_url, headers={"Accept": "application/vnd.github+json"})
+        api_url, headers={"Accept": "application/vnd.github+json"}
+    )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            release = json.loads(
-                response.read().decode("utf-8", errors="ignore"))
+            release = json.loads(response.read().decode("utf-8", errors="ignore"))
     except urllib.error.URLError as exc:
         raise RuntimeError(
-            f"Unable to fetch latest release for {owner}/{repo}: {exc}") from exc
+            f"Unable to fetch latest release for {owner}/{repo}: {exc}"
+        ) from exc
 
     assets = release.get("assets") or []
     mapping: dict[str, str] = {}
@@ -214,7 +220,8 @@ def _github_release_assets(owner: str, repo: str) -> dict[str, str]:
             mapping[name] = url
     if not mapping:
         raise RuntimeError(
-            f"No downloadable assets found for {owner}/{repo} latest release")
+            f"No downloadable assets found for {owner}/{repo} latest release"
+        )
     return mapping
 
 
@@ -228,18 +235,17 @@ def _select_xray_asset(assets: dict[str, str]) -> str:
             wanted = "Xray-windows-arm64-v8a.zip"
         else:
             raise RuntimeError(
-                f"Unsupported architecture for Xray-core on Windows: {machine}")
+                f"Unsupported architecture for Xray-core on Windows: {machine}"
+            )
     elif system in {"linux", "darwin"}:
         if machine in {"x86_64", "amd64"}:
             wanted = "Xray-linux-64.zip"
         elif machine in {"aarch64", "arm64"}:
             wanted = "Xray-linux-arm64-v8a.zip"
         else:
-            raise RuntimeError(
-                f"Unsupported architecture for Xray-core: {machine}")
+            raise RuntimeError(f"Unsupported architecture for Xray-core: {machine}")
     else:
-        raise RuntimeError(
-            f"Unsupported operating system for Xray-core: {system}")
+        raise RuntimeError(f"Unsupported operating system for Xray-core: {system}")
 
     if wanted not in assets:
         raise RuntimeError(f"Xray asset {wanted} not found in latest release")
@@ -252,29 +258,29 @@ def _select_converter_asset(assets: dict[str, str]) -> str:
     if system == "windows":
         if machine in {"x86_64", "amd64"}:
             wanted = _select_asset_by_pattern(
-                assets, r"^ProxyConverter-win-x64(?:\.exe)?$")
+                assets, r"^ProxyConverter-win-x64(?:\.exe)?$"
+            )
         elif machine in {"aarch64", "arm64"}:
             wanted = _select_asset_by_pattern(
-                assets, r"^ProxyConverter-win-arm64(?:\.exe)?$")
+                assets, r"^ProxyConverter-win-arm64(?:\.exe)?$"
+            )
         else:
             raise RuntimeError(
-                f"Unsupported architecture for ProxyConverter on Windows: {machine}")
+                f"Unsupported architecture for ProxyConverter on Windows: {machine}"
+            )
         if wanted:
             return wanted
-        raise RuntimeError(
-            "ProxyConverter Windows asset not found in latest release")
+        raise RuntimeError("ProxyConverter Windows asset not found in latest release")
 
     if machine in {"x86_64", "amd64"}:
         wanted = "ProxyConverter-linux-x64"
     elif machine in {"aarch64", "arm64"}:
         wanted = "ProxyConverter-linux-arm64"
     else:
-        raise RuntimeError(
-            f"Unsupported architecture for ProxyConverter: {machine}")
+        raise RuntimeError(f"Unsupported architecture for ProxyConverter: {machine}")
 
     if wanted not in assets:
-        raise RuntimeError(
-            f"ProxyConverter asset {wanted} not found in latest release")
+        raise RuntimeError(f"ProxyConverter asset {wanted} not found in latest release")
     return wanted
 
 
@@ -293,7 +299,7 @@ def _build_link_batches(
     batch_size = max(1, chunk_size or len(links))
 
     for index in range(0, len(links), batch_size):
-        yield links[index:index + batch_size]
+        yield links[index : index + batch_size]
 
 
 def _download_file(url: str, destination: Path) -> None:

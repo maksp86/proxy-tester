@@ -6,7 +6,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from .models import UrlTestResult, Subscripton
+
+from .models import SpeedTestResult, Subscripton, UrlTestResult
 
 
 @dataclass
@@ -50,8 +51,7 @@ class Database:
     def init_schema(self) -> None:
         with self._write_lock:
             with self.connect() as conn:
-                conn.executescript(
-                    """
+                conn.executescript("""
                     CREATE TABLE IF NOT EXISTS proxies (
                         proxy_hash TEXT PRIMARY KEY,
                         raw_link TEXT NOT NULL,
@@ -94,8 +94,7 @@ class Database:
                         link TEXT PRIMARY KEY,
                         last_data_hash TEXT NOT NULL
                     ) WITHOUT ROWID;
-                    """
-                )
+                    """)
 
     def cleanup_expired_dead(self) -> int:
         now_iso = utc_now().isoformat()
@@ -125,8 +124,7 @@ class Database:
                         scheme = excluded.scheme,
                         last_seen_at = excluded.last_seen_at
                     """,
-                    [(h, link, sch, now_iso, now_iso)
-                     for h, link, sch in rows],
+                    [(h, link, sch, now_iso, now_iso) for h, link, sch in rows],
                 )
 
     def is_dead(self, proxy_hash: str) -> bool:
@@ -151,7 +149,7 @@ class Database:
 
             conn.executemany(
                 "INSERT INTO temp_hashes (proxy_hash) VALUES (?)",
-                [(proxy_hash,) for proxy_hash in unique_hashes]
+                [(proxy_hash,) for proxy_hash in unique_hashes],
             )
 
             rows = conn.execute(
@@ -166,8 +164,9 @@ class Database:
 
             dead_hashes = {row["proxy_hash"] for row in rows}
 
-        # Возвращаем живые хеши
-        return {proxy_hash for proxy_hash in unique_hashes if proxy_hash not in dead_hashes}
+        return {
+            proxy_hash for proxy_hash in unique_hashes if proxy_hash not in dead_hashes
+        }
 
     def mark_dead(self, proxy_hash: str, reason: str, ttl_days: int) -> None:
         self.mark_dead_many([(proxy_hash, reason)], ttl_days=ttl_days)
@@ -213,7 +212,9 @@ class Database:
                             expires_at,
                         )
                         for proxy_hash, reason in rows
-                        for raw_link, scheme in [self._get_proxy_identity(by_hash, proxy_hash)]
+                        for raw_link, scheme in [
+                            self._get_proxy_identity(by_hash, proxy_hash)
+                        ]
                     ],
                 )
                 conn.executemany(
@@ -260,8 +261,8 @@ class Database:
                     ],
                 )
 
-    def mark_speed_results(self, rows: list[dict]) -> None:
-        if not rows:
+    def mark_speed_results(self, results: list[SpeedTestResult]) -> None:
+        if not results:
             return
         now_iso = utc_now().isoformat()
         with self._write_lock:
@@ -277,25 +278,21 @@ class Database:
                     [
                         (
                             now_iso,
-                            "speed_ok" if row["success"] else "dead",
-                            row.get("mbps"),
-                            row["proxy_hash"],
+                            "speed_ok" if res.success else "dead",
+                            res.mbps,
+                            res.proxy_hash,
                         )
-                        for row in rows
+                        for res in results
                     ],
                 )
 
-    def get_recent_selected(self, limit: int) -> list[sqlite3.Row]:
+    def get_recent_selected(self) -> list[sqlite3.Row]:
         with self.connect() as conn:
-            return conn.execute(
-                """
+            return conn.execute("""
                 SELECT s.*
                 FROM selected_proxies s
                 ORDER BY s.selected_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+                """).fetchall()
 
     def get_recent_url_ok(self, limit: int) -> list[sqlite3.Row]:
         with self.connect() as conn:
@@ -318,8 +315,7 @@ class Database:
 
     def get_recent_all(self, limit: int) -> list[sqlite3.Row]:
         with self.connect() as conn:
-            return conn.execute(
-                """
+            return conn.execute("""
                 SELECT
                   p.proxy_hash,
                   p.raw_link,
@@ -329,34 +325,35 @@ class Database:
                   p.city
                 FROM proxies p
                 ORDER BY p.latency_ms ASC, p.last_checked_at DESC
-                """
-            ).fetchall()
+                """).fetchall()
 
-    def store_selected(self, rows: list[dict]) -> None:
+    def store_selected(self, selected: list[str]) -> None:
+        if not selected:
+            return
         now_iso = utc_now().isoformat()
         with self._write_lock:
             with self.connect() as conn:
                 conn.execute("DELETE FROM selected_proxies")
-                conn.executemany(
-                    """
-                    INSERT INTO selected_proxies(
-                        proxy_hash, selected_at, raw_link, latency_ms, mbps, exit_ip, country, city
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            r["proxy_hash"],
-                            now_iso,
-                            r["raw_link"],
-                            r.get("latency_ms"),
-                            r.get("mbps"),
-                            r.get("exit_ip"),
-                            r.get("country"),
-                            r.get("city"),
-                        )
-                        for r in rows
-                    ],
-                )
+
+                placeholders = ",".join("?" for _ in selected)
+
+                query = f"""
+                    INSERT INTO selected_proxies
+                        (proxy_hash, selected_at, raw_link, latency_ms, mbps, exit_ip, country, city)
+                    SELECT proxy_hash,
+                        ? AS selected_at,
+                        raw_link,
+                        latency_ms,
+                        mbps,
+                        exit_ip,
+                        country,
+                        city
+                    FROM proxies
+                    WHERE proxy_hash IN ({placeholders})
+                """
+
+                params = [now_iso] + selected
+                conn.execute(query, params)
 
     def get_subscription(self, link: str) -> Subscripton | None:
         if not link:
@@ -368,10 +365,11 @@ class Database:
                     SELECT link, last_data_hash FROM subscriptions
                     WHERE link = ?
                     """,
-                    (link,)
+                    (link,),
                 ).fetchone()
                 if row is not None:
                     return Subscripton(row["link"], row["last_data_hash"])
+        return None
 
     def upsert_subscription(self, subscription: Subscripton) -> None:
         if not subscription:
@@ -386,5 +384,5 @@ class Database:
                         link = excluded.link,
                         last_data_hash = excluded.last_data_hash
                     """,
-                    (subscription.link, subscription.last_data_hash)
+                    (subscription.link, subscription.last_data_hash),
                 )
