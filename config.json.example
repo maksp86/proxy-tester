@@ -17,5 +17,7 @@
   "speed_min_mb_s": 1.0,
   "speed_test_url": "https://github.com/jamesward/play-load-tests/raw/refs/heads/master/public/10mb.txt",
   "target_final_count": 25,
-  "dead_ttl_days": 30
+  "dead_ttl_days": 30,
+  "xray_worker_count": 10,
+  "xray_tasks_per_worker": 100
 }

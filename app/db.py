@@ -19,7 +19,7 @@ class ProxyRecord:
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(timezone.utc)  # noqa: UP017 (runtime uses Python 3.10)
 
 
 class Database:
@@ -315,17 +315,45 @@ class Database:
 
     def get_recent_all(self, limit: int) -> list[sqlite3.Row]:
         with self.connect() as conn:
-            return conn.execute("""
+            return conn.execute(
+                """
                 SELECT
                   p.proxy_hash,
                   p.raw_link,
+                  p.scheme,
                   p.latency_ms,
                   p.exit_ip,
                   p.country,
                   p.city
                 FROM proxies p
                 ORDER BY p.latency_ms ASC, p.last_checked_at DESC
-                """).fetchall()
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+    def stream_proxies(self, fetch_size: int = 256):
+        fetch_size = max(1, fetch_size)
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                SELECT
+                  p.proxy_hash,
+                  p.raw_link,
+                  p.scheme,
+                  p.latency_ms,
+                  p.exit_ip,
+                  p.country,
+                  p.city
+                FROM proxies p
+                ORDER BY p.last_checked_at DESC, p.proxy_hash ASC
+                """
+            )
+            while True:
+                rows = cursor.fetchmany(fetch_size)
+                if not rows:
+                    return
+                yield from rows
 
     def store_selected(self, selected: list[str]) -> None:
         if not selected:
@@ -354,6 +382,27 @@ class Database:
 
                 params = [now_iso] + selected
                 conn.execute(query, params)
+
+    def count_proxies(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS cnt FROM proxies").fetchone()
+            return int(row["cnt"] if row is not None else 0)
+
+    def select_top_speed(self, limit: int, min_speed_mb_s: float) -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT p.proxy_hash
+                FROM proxies p
+                WHERE p.last_status = 'speed_ok'
+                  AND p.mbps IS NOT NULL
+                  AND p.mbps >= ?
+                ORDER BY p.mbps DESC, p.latency_ms ASC, p.last_checked_at DESC
+                LIMIT ?
+                """,
+                (min_speed_mb_s, limit),
+            ).fetchall()
+            return [str(row["proxy_hash"]) for row in rows]
 
     def get_subscription(self, link: str) -> Subscripton | None:
         if not link:

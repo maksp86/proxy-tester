@@ -9,26 +9,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class AppConfig:
-    """Application runtime settings loaded from JSON.
-
-    Attributes:
-        db_path: SQLite database file path.
-        export_file: Output file path for selected proxies.
-        subscription_urls: Subscription endpoints used for candidate collection.
-        geoip_db_path: Local GeoIP database path (`.mmdb`).
-        geoip_db_url: Optional URL for downloading `geoip_db_path` at startup.
-        url_batch_size: Maximum concurrent URL tests (rolling window).
-        url_timeout_seconds: Timeout for URL reachability checks.
-        url_test_attempts: Number of URL-test attempts per proxy (best latency wins).
-        url_urls: Candidate healthcheck URLs; first URL is used as probe target.
-        speed_top_n: Number of lowest-latency proxies to include in speed stage.
-        speed_batch_size: Maximum concurrent speed tests (rolling window).
-        speed_timeout_seconds: Timeout for speed checks.
-        speed_min_mb_s: Minimum accepted download speed in MB/s.
-        speed_test_url: URL used for download speed checks.
-        target_final_count: Target number of exported proxies.
-        dead_ttl_days: How long failed proxies remain in dead-list.
-    """
+    """Application runtime settings loaded from JSON."""
 
     db_path: Path = Path("proxy_pool.sqlite3")
     export_file: Path = Path("result.txt")
@@ -43,6 +24,10 @@ class AppConfig:
     url_timeout_seconds: float = 1.0
     test_attempts: int = 1
     url_test_url: str = "https://www.gstatic.com/generate_204"
+
+    # Shared Xray worker pool settings
+    xray_worker_count: int = 10
+    xray_tasks_per_worker: int = 100
 
     # Speed test settings
     speed_top_n: int = 100
@@ -62,7 +47,7 @@ class AppConfig:
 
 DEFAULT_CONFIG = AppConfig()
 _PATH_FIELDS = {"db_path", "export_file", "geoip_db_path"}
-_TUPLE_FIELDS = {"subscription_urls"}
+_TUPLE_FIELDS = {"subscription_urls", "exclude_countries"}
 
 
 def _coerce_config_value(key: str, value: Any) -> Any:
@@ -78,11 +63,7 @@ def _coerce_config_value(key: str, value: Any) -> Any:
 
 
 def _read_config_payload(config_path: Path) -> dict[str, Any]:
-    """Read JSON config payload from disk.
-
-    Raises:
-        ValueError: If file extension is not `.json` or payload root is not an object.
-    """
+    """Read JSON config payload from disk."""
 
     suffix = config_path.suffix.lower()
     if suffix != ".json":
@@ -95,11 +76,7 @@ def _read_config_payload(config_path: Path) -> dict[str, Any]:
 
 
 def load_config(config_path: Path | None) -> AppConfig:
-    """Load JSON configuration and merge it over defaults.
-
-    Args:
-        config_path: Path to JSON config file. If `None`, returns defaults.
-    """
+    """Load JSON configuration and merge it over defaults."""
 
     if config_path is None:
         logging.debug("No --config provided. Using DEFAULT_CONFIG.")

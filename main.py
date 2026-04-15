@@ -60,7 +60,11 @@ async def _amain(verbose: bool, config_path: Path | None) -> None:
     ensure_geoip_database(cfg.geoip_db_path, cfg.geoip_db_url)
 
     db = Database(cfg.db_path)
-    probe = ProxyProbe(geoip_db_path=cfg.geoip_db_path)
+    probe = ProxyProbe(
+        geoip_db_path=cfg.geoip_db_path,
+        worker_count=cfg.xray_worker_count,
+        tasks_per_worker=cfg.xray_tasks_per_worker,
+    )
     await run_once(cfg, db, probe)
 
 

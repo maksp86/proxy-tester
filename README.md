@@ -14,7 +14,7 @@
    Seeds candidates from recent successful records and fresh subscriptions, skipping proxies currently present in the dead list (`dead_proxies`) until TTL expiration.
 
 4. **URL test stage**  
-   Runs rolling-concurrency URL checks through Xray local inbounds. For each proxy, stores the latest status/latency/geo metadata in `proxies`.
+   Runs continuous URL checks through a bounded Xray worker pool (`xray_worker_count`) with worker recycling (`xray_tasks_per_worker`). For each proxy, stores the latest status/latency/geo metadata in `proxies`.
 
 5. **Speed test stage**  
    Selects the best latency subset (`speed_top_n`) and runs rolling-concurrency download speed checks. Proxies that fail speed checks or threshold filters are moved to `dead_proxies`.
@@ -29,4 +29,4 @@
   - `proxies`: current active/known proxy state
   - `dead_proxies`: temporarily excluded proxies with TTL
   - `selected_proxies`: last exported result set
-- URL and speed checks are executed through local Xray runtime generated from ProxyConverter configs.
+- URL and speed checks are executed through a bounded Xray worker pool configured at startup; outbounds and routing rules are pushed over Xray API via stdin payloads.

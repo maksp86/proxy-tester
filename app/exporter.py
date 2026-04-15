@@ -26,7 +26,8 @@ def format_comment(
         parts.append(f"IP={exit_ip}")
     geo = ",".join([x for x in [city, country] if x])
     if geo:
-        parts.append(f"Geo={geo} {flag.flag(country) if country else ""}")
+        country_flag = flag.flag(country) if country else ""
+        parts.append(f"Geo={geo} {country_flag}".strip())
     if latency_ms is not None:
         parts.append(f"URL={latency_ms:.0f}ms")
     if mbps is not None:
@@ -64,7 +65,7 @@ def write_export(path: Path, db: Database, info: dict[str, Any] | None = None) -
         seconds = int(info.get("elapsed_time", 0) % 60)
         export += f"# Time elapsed: {hours:02d}:{minutes:02d}:{seconds:02d}\n"
 
-        export += f"# Candidates processed: {info.get("candidates")}\n"
+        export += f"# Candidates processed: {info.get('candidates')}\n"
 
     export += "\n".join(lines) + ("\n" if lines else "")
     path.write_text(export, encoding="utf-8")
