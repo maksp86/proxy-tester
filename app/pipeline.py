@@ -253,9 +253,9 @@ async def run_once(config: AppConfig, db: Database, toolchain: XrayToolchain) ->
     end_time = time.perf_counter()
 
     write_export(
-        config.export_file,
+        config.export_options,
         db,
         {"elapsed_time": end_time - start_time, "candidates": candidates_count},
     )
-    LOGGER.info("Export saved to %s", config.export_file)
+    LOGGER.info("Export saved to %s", config.export_options.file)
     LOGGER.info("Pipeline completed.")

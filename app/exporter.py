@@ -7,6 +7,7 @@ from typing import Any
 
 import flag
 
+from .config import ExportConfig
 from .db import Database
 
 
@@ -46,7 +47,7 @@ def render_link_with_comment(raw_link: str, comment: str) -> str:
     return f"{clean}#{comment}"
 
 
-def write_export(path: Path, db: Database, info: dict[str, Any] | None = None) -> None:
+def write_export(config: ExportConfig, db: Database, info: dict[str, Any] | None = None) -> None:
     lines: list[str] = []
     for item in db.get_selected():
         comment = format_comment(
@@ -58,7 +59,13 @@ def write_export(path: Path, db: Database, info: dict[str, Any] | None = None) -
         )
         lines.append(render_link_with_comment(item["raw_link"], comment))
 
-    export = f"# Exported at {utc_now().isoformat()}\n"
+    export = f"#profile-title: {config.title}\n"
+    export += f"#profile-update-interval: {config.update_interval}\n"
+    
+    if config.web_page_url:
+        export += f"#profile-web-page-url: {config.web_page_url}\n"
+
+    export += f"# Exported at {utc_now().isoformat()}\n"
     export += f"# Count: {len(lines)}\n"
 
     if info is not None:
@@ -72,4 +79,4 @@ def write_export(path: Path, db: Database, info: dict[str, Any] | None = None) -
         export += f"# Candidates processed: {info.get("candidates")}\n"
 
     export += "\n".join(lines) + ("\n" if lines else "")
-    path.write_text(export, encoding="utf-8")
+    config.file.write_text(export, encoding="utf-8")

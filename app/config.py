@@ -168,6 +168,12 @@ class CIDRConfig(BaseModel):
         return self
 
 
+class ExportConfig(BaseModel):
+    file: Path = Path("result.txt")
+    title: str = "proxy-tester"
+    update_interval: int = 24
+    web_page_url: HttpUrl | None = None
+
 class FilterConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -184,11 +190,12 @@ class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     db_path: Path = Path("proxy_pool.sqlite3")
-    export_file: Path = Path("result.txt")
     subscription_urls: list[HttpUrl] = Field(min_length=1)
 
     tester: TesterConfig = Field(default_factory=TesterConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
+
+    export_options: ExportConfig = Field(default_factory=ExportConfig)
 
     @field_validator("db_path", "export_file", mode="before")
     @classmethod
