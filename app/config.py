@@ -197,7 +197,7 @@ class AppConfig(BaseModel):
 
     export_options: ExportConfig = Field(default_factory=ExportConfig)
 
-    @field_validator("db_path", "export_file", mode="before")
+    @field_validator("db_path", mode="before")
     @classmethod
     def _path_not_empty(cls, v: Any) -> Any:
         return _non_empty_path(v)
