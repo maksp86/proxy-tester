@@ -55,18 +55,6 @@ def _url_test_url() -> HttpUrl:
     return HttpUrl("https://www.gstatic.com/generate_204")
 
 
-def _geoip_url() -> HttpUrl:
-    return HttpUrl(
-        "https://github.com/P3TERX/GeoLite.mmdb/releases/download/2026.04.16/GeoLite2-City.mmdb"
-    )
-
-
-def _cidr_url() -> HttpUrl:
-    return HttpUrl(
-        "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/cidrwhitelist.txt"
-    )
-
-
 class SpeedTestConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -130,7 +118,7 @@ class TesterConfig(BaseModel):
 class GeoIPConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    url: HttpUrl = Field(default_factory=_geoip_url)
+    url: HttpUrl | None = None
     path: Path = Path("GeoLite2-City.mmdb")
     method: Literal["exclude", "include"] = "exclude"
     countries: list[str] = Field(default_factory=list)
@@ -153,7 +141,7 @@ class GeoIPConfig(BaseModel):
 class CIDRConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    url: HttpUrl | None = Field(default_factory=_cidr_url)
+    url: HttpUrl | None = None
     path: Path = Path("cidr.txt")
     method: Literal["exclude", "include"] = "exclude"
 

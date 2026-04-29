@@ -50,7 +50,7 @@ class GeoIPReader:
             if not self._config.path.exists():
                 self._geoip_error = f"geoip_db_not_found:{self._config.path}"
                 return None
-            self._geoip_reader = geoip2.database.Reader(str(self._config.path))
+            self._geoip_reader = geoip2.database.Reader(self._config.path)
             return self._geoip_reader
         except Exception as exc:
             self._geoip_error = f"geoip_reader_init_failed:{exc}"
