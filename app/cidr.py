@@ -28,8 +28,9 @@ class CIDRReader:
         self.config = config
 
         self._path: Path | None = None
-        self._networks: list[ipaddress.IPv4Network |
-                             ipaddress.IPv6Network] | None = None
+        self._networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] | None = (
+            None
+        )
 
         self._resolver_lock = asyncio.Lock()
         self._networks_lock = asyncio.Lock()
@@ -47,8 +48,7 @@ class CIDRReader:
                 raise FileNotFoundError(f"CIDR file not found: {path}")
 
             path.parent.mkdir(parents=True, exist_ok=True)
-            LOGGER.info("Downloading CIDR file from %s to %s",
-                        self.config.url, path)
+            LOGGER.info("Downloading CIDR file from %s to %s", self.config.url, path)
             urllib.request.urlretrieve(str(self.config.url), str(path))
             LOGGER.info("CIDR file downloaded to %s", path)
 
@@ -170,7 +170,8 @@ class CIDRReader:
             task = self._dns_inflight.get(host_key)
             if task is None:
                 task = asyncio.create_task(
-                    self._resolve_host_addresses_uncached(host_key))
+                    self._resolve_host_addresses_uncached(host_key)
+                )
                 self._dns_inflight[host_key] = task
 
         try:

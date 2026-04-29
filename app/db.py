@@ -308,8 +308,7 @@ class Database:
     def count_candidate_proxies(self) -> int:
         with self._write_lock:
             with self.connect() as conn:
-                num_fresh = conn.execute(
-                    "SELECT COUNT(*) FROM proxies").fetchone()[0]
+                num_fresh = conn.execute("SELECT COUNT(*) FROM proxies").fetchone()[0]
                 return num_fresh
 
     def count_candidate_proxies_with_status(self, status: str) -> int:
@@ -357,8 +356,7 @@ class Database:
             with self.connect() as conn:
                 cur = conn.cursor()
 
-                country_placeholders = ",".join(
-                    "?" for _ in geoip_config.countries)
+                country_placeholders = ",".join("?" for _ in geoip_config.countries)
                 filter_mode = " " if geoip_config.method == "exclude" else " NOT "
 
                 sql = f"""

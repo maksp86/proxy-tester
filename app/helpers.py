@@ -26,8 +26,7 @@ def is_safe_xhttp_config(outbound: dict[str, Any]) -> bool:
     if network not in ("xhttp", "splithttp", "httpupgrade"):
         return True
 
-    xhttp = stream.get("xhttpSettings") or stream.get(
-        "splithttpSettings") or {}
+    xhttp = stream.get("xhttpSettings") or stream.get("splithttpSettings") or {}
     tls = stream.get("tlsSettings") or {}
     reality = stream.get("realitySettings") or {}
 

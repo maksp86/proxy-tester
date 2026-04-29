@@ -53,8 +53,7 @@ async def collect_candidates(
     db.prepare_fresh_candidates_table()
 
     batches = await tqdm.asyncio.tqdm.gather(
-        *(_process_source(str(url), db, toolchain, semaphore)
-          for url in source_urls),
+        *(_process_source(str(url), db, toolchain, semaphore) for url in source_urls),
         desc="Fetch subscriptions",
         unit="source",
         mininterval=1
@@ -139,8 +138,7 @@ async def _process_source(
         try:
             parsed_configs = await toolchain.convert_links(clean_links)
         except Exception:
-            LOGGER.exception(
-                "Failed to parse links with ProxyConverter: %s", url)
+            LOGGER.exception("Failed to parse links with ProxyConverter: %s", url)
             return [], total_links
 
         candidates: list[CandidateProxy] = []

@@ -5,8 +5,8 @@ import logging
 import time
 from typing import Any
 
-from tqdm.asyncio import tqdm_asyncio
 from tqdm import tqdm
+from tqdm.asyncio import tqdm_asyncio
 
 from .batch_operations import BatchCandidateReader, BatchTestResultWriter
 from .cidr import CIDRReader
@@ -24,10 +24,12 @@ from .xray_queue import XrayOrchestrator
 LOGGER = logging.getLogger(__name__)
 
 
-async def _cidr_filter_one(proxy: CandidateProxy,
-                           outbound: dict[str, Any] | None,
-                           cidr_reader: CIDRReader,
-                           result_writer: BatchTestResultWriter):
+async def _cidr_filter_one(
+    proxy: CandidateProxy,
+    outbound: dict[str, Any] | None,
+    cidr_reader: CIDRReader,
+    result_writer: BatchTestResultWriter,
+):
     if not outbound:
         return result_writer.add(
             ProxyTestResult(
@@ -47,7 +49,9 @@ async def _cidr_filter_one(proxy: CandidateProxy,
         ProxyTestResult(
             proxy_hash=proxy.proxy_hash,
             success=success,
-            reason=TestResultReasons.OK if success else TestResultReasons.CIDR_DISCARDED,
+            reason=(
+                TestResultReasons.OK if success else TestResultReasons.CIDR_DISCARDED
+            ),
             kind=TestResultKind.CIDR,
         )
     )
@@ -116,8 +120,7 @@ async def _url_test_stage(
         candidate_reader, total=candidates_count, desc="URL-test", mininterval=2
     ):
         task = asyncio.create_task(
-            proxy_tester.url_test_proxy(
-                geoip_reader, proxy, outbound, config.tester)
+            proxy_tester.url_test_proxy(geoip_reader, proxy, outbound, config.tester)
         )
         tasks.add(task)
 
@@ -177,11 +180,11 @@ async def _speed_test_stage(
             _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             if stop_controller.should_stop():
                 break
-    
+
     pbar.n = stop_controller.success
     pbar.refresh()
     pbar.close()
-    
+
     if tasks:
         if stop_controller.should_stop():
             LOGGER.debug("Speed test target count reached")
@@ -189,8 +192,10 @@ async def _speed_test_stage(
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         else:
-            await tqdm_asyncio.gather(*tasks, desc="Finishing speed test", mininterval=2)
-    
+            await tqdm_asyncio.gather(
+                *tasks, desc="Finishing speed test", mininterval=2
+            )
+
     await orchestrator.stop()
     result_writer.flush()
 
