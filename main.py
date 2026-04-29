@@ -3,13 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import urllib.request
 from pathlib import Path
 
-from app.config import load_config
+from app.config import AppConfig
 from app.db import Database
 from app.pipeline import run_once
-from app.probe import ProxyProbe
+from app.xray_backend import XrayToolchain
 
 
 def setup_logging(verbose: bool) -> None:
@@ -27,25 +26,7 @@ def setup_logging(verbose: bool) -> None:
     logging.debug("Logging initialized. verbose=%s", verbose)
 
 
-def ensure_geoip_database(geoip_db_path: Path, geoip_db_url: str | None) -> None:
-    """Ensure local GeoIP database exists.
-
-    Args:
-        geoip_db_path: Local destination path for `.mmdb`.
-        geoip_db_url: Optional download URL. If absent, no download is attempted.
-    """
-
-    if not geoip_db_url:
-        logging.debug("geoip_db_url is not set. Skipping GeoIP download.")
-        return
-
-    logging.info("Downloading GeoIP DB from %s to %s", geoip_db_url, geoip_db_path)
-    geoip_db_path.parent.mkdir(parents=True, exist_ok=True)
-    urllib.request.urlretrieve(geoip_db_url, geoip_db_path)
-    logging.info("GeoIP DB download complete: %s", geoip_db_path)
-
-
-async def _amain(verbose: bool, config_path: Path | None) -> None:
+async def _amain(verbose: bool, config_path: Path) -> None:
     """Entrypoint for async pipeline execution.
 
     Args:
@@ -54,20 +35,23 @@ async def _amain(verbose: bool, config_path: Path | None) -> None:
     """
 
     setup_logging(verbose)
-    cfg = load_config(config_path)
-    logging.info("Using config: %s", cfg)
-
-    ensure_geoip_database(cfg.geoip_db_path, cfg.geoip_db_url)
+    cfg = AppConfig.from_json_file(config_path)
 
     db = Database(cfg.db_path)
-    probe = ProxyProbe(geoip_db_path=cfg.geoip_db_path)
-    await run_once(cfg, db, probe)
+    toolchain = XrayToolchain()
+
+    logging.debug("Ensuring toolchain exists..")
+    toolchain.ensure_converter()
+    toolchain.ensure_xray()
+    logging.debug("Ensuring toolchain exists.. Done")
+
+    await run_once(cfg, db, toolchain)
 
 
 def main() -> None:
     """CLI wrapper."""
 
-    parser = argparse.ArgumentParser(description="Nightly proxy list tester")
+    parser = argparse.ArgumentParser(description="Proxy subscriptions tester")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument(
         "--config",

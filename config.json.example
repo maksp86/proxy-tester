@@ -1,21 +1,47 @@
 {
-  "db_path": "proxy_pool.sqlite3",
-  "export_file": "result.txt",
-  "subscription_urls": [
-    "https://example.com/subscription-1",
-    "https://example.com/subscription-2"
-  ],
-  "geoip_db_path": "geoip/GeoLite2-City.mmdb",
-  "geoip_db_url": null,
-  "url_batch_size": 25,
-  "url_timeout_seconds": 1.0,
-  "test_attempts": 3,
-  "url_test_url": "https://www.gstatic.com/generate_204",
-  "speed_top_n": 100,
-  "speed_batch_size": 25,
-  "speed_timeout_seconds": 10.0,
-  "speed_min_mb_s": 1.0,
-  "speed_test_url": "https://github.com/jamesward/play-load-tests/raw/refs/heads/master/public/10mb.txt",
-  "target_final_count": 25,
-  "dead_ttl_days": 30
+    "db_path": "proxy_pool.sqlite3",
+    "export_file": "result.txt",
+    "subscription_urls": [...],
+    "tester": {
+        "speed_test": {
+            "url": "http://cachefly.cachefly.net/10mb.test",
+            "worker_count": 5,
+            "worker_tasks_count": 5,
+            "speed_threshold": 1.0,
+            "timeout": "10s"
+        },
+        "url_test": {
+            "url": "https://www.gstatic.com/generate_204",
+            "worker_count": 5,
+            "worker_tasks_count": 10,
+            "timeout": "2s"
+        },
+        "target_final_count": 50,
+        "test_attempts": 3,
+        "dead_ttl_days": 30
+    },
+    "filter": {
+        "geoip": {
+            "path": "geoip/GeoLite2-City.mmdb",
+            "method": "exclude",
+            "countries": [
+                "RU"
+            ]
+        },
+        "cidr": {
+            "path": "cidrwhitelist.txt",
+            "method": "include",
+            "dns_nameservers_pool": [
+                [
+                    "1.1.1.1",
+                    "1.0.0.1"
+                ],
+                [
+                    "8.8.8.8",
+                    "8.8.4.4"
+                ]
+            ],
+            "dns_cache_ttl": 300
+        }
+    }
 }

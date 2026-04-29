@@ -3,7 +3,9 @@ import hashlib
 import logging
 
 import tqdm.asyncio
+from pydantic import HttpUrl
 
+from .config import AppConfig
 from .db import Database
 from .models import CandidateProxy
 from .xray_backend import XrayToolchain, fetch_subscription_links
@@ -27,47 +29,77 @@ def hash_link(link: str) -> str:
     return hashlib.sha256(link.encode("utf-8")).hexdigest()
 
 
-async def collect_candidates(
-    source_urls: list[str],
-    db: Database,
-    toolchain: XrayToolchain,
-) -> list[CandidateProxy]:
-    """Fetch and parse candidates from all configured subscriptions."""
+async def fetch_candidates(
+    config: AppConfig, db: Database, toolchain: XrayToolchain
+) -> int:
+    """Обновляет таблицу proxies свежими прокси из подписок (только живые)."""
+    source_urls = list(config.subscription_urls)
+    LOGGER.info("Loaded %s source URLs from config", len(source_urls))
 
+    added = await collect_candidates(source_urls, db, toolchain)
+
+    LOGGER.info("Added fresh alive candidates from subscriptions: %s", added)
+    return added
+
+
+async def collect_candidates(
+    source_urls: list[HttpUrl], db: Database, toolchain: XrayToolchain
+) -> int:
+    """Собирает прокси из всех подписок → temp-таблица → merge в proxies.
+    Возвращает только количество добавленных/обновлённых живых прокси.
+    """
     semaphore = asyncio.Semaphore(5)
-    seen: set[str] = set()
+
+    db.prepare_fresh_candidates_table()
 
     batches = await tqdm.asyncio.tqdm.gather(
-        *(_process_source(url, db, toolchain, semaphore) for url in source_urls),
+        *(_process_source(str(url), db, toolchain, semaphore)
+          for url in source_urls),
         desc="Fetch subscriptions",
         unit="source",
+        mininterval=1
     )
 
-    out: list[CandidateProxy] = []
     total_links = 0
+    total_parsed = 0
 
-    for candidates, batch_total in batches:
+    for batch_data, batch_total in batches:
         total_links += batch_total
+        if not batch_data:
+            continue
+        total_parsed += len(batch_data)
+        db.insert_fresh_candidates_batch(batch_data)
 
-        for candidate in candidates:
-            if candidate.proxy_hash in seen:
-                continue
-            seen.add(candidate.proxy_hash)
-            out.append(candidate)
+    num_fresh = db.count_fresh_candidates()
 
     LOGGER.info(
-        "Collected deduplicated candidates: %s, total: %s",
-        len(out),
+        "Collected unique fresh candidates: %s (parsed: %s, total links: %s)",
+        num_fresh,
+        total_parsed,
         total_links,
     )
-    return out
+
+    if num_fresh == 0:
+        db.cleanup_fresh_candidates_table()
+        return 0
+
+    added = db.merge_fresh_candidates_to_proxies()
+
+    LOGGER.info(
+        "Added fresh alive candidates: %s (skipped dead=%s)",
+        added,
+        num_fresh - added,
+    )
+
+    db.cleanup_fresh_candidates_table()
+    return added
 
 
 async def _process_source(
     url: str, db: Database, toolchain: XrayToolchain, semaphore: asyncio.Semaphore
 ) -> tuple[list[CandidateProxy], int]:
     async with semaphore:
-        LOGGER.info("Fetching subscription: %s", url)
+        LOGGER.debug("Fetching subscription: %s", url)
 
         try:
             links, subscription = await fetch_subscription_links(url, timeout=10)
@@ -107,17 +139,18 @@ async def _process_source(
         try:
             parsed_configs = await toolchain.convert_links(clean_links)
         except Exception:
-            LOGGER.exception("Failed to parse links with ProxyConverter: %s", url)
+            LOGGER.exception(
+                "Failed to parse links with ProxyConverter: %s", url)
             return [], total_links
 
         candidates: list[CandidateProxy] = []
         for link in clean_links:
-            parsed_config = parsed_configs.get(link)
-            if parsed_config is None:
+            parsed_outbound = parsed_configs.get(link)
+            if parsed_outbound is None:
                 continue
 
             digest = hash_link(link)
-            scheme = parsed_config["outbounds"][0]["protocol"]
+            scheme = parsed_outbound["protocol"]
             candidates.append(
                 CandidateProxy(
                     proxy_hash=digest,

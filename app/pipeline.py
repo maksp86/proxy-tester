@@ -1,130 +1,201 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
+from typing import Any
 
-from .config import AppConfig
+from tqdm.asyncio import tqdm_asyncio
+from tqdm import tqdm
+
+from .batch_operations import BatchCandidateReader, BatchTestResultWriter
+from .cidr import CIDRReader
+from .config import AppConfig, CIDRConfig
 from .db import Database
 from .exporter import write_export
-from .models import CandidateProxy
-from .probe import ProxyProbe
-from .subscriptions import collect_candidates
+from .geoip import GeoIPReader
+from .helpers import StopController, find_key_nonrecursive
+from .models import CandidateProxy, ProxyTestResult, TestResultKind, TestResultReasons
+from .proxy_tester import ProxyTester
+from .subscriptions import fetch_candidates
+from .xray_backend import XrayToolchain
+from .xray_queue import XrayOrchestrator
 
 LOGGER = logging.getLogger(__name__)
 
 
-def _take_candidates(
-    candidates: list[CandidateProxy], start: int, n: int
-) -> tuple[list[CandidateProxy], int]:
-    return candidates[start : start + n], start + n
+async def _cidr_filter_one(proxy: CandidateProxy,
+                           outbound: dict[str, Any] | None,
+                           cidr_reader: CIDRReader,
+                           result_writer: BatchTestResultWriter):
+    if not outbound:
+        return result_writer.add(
+            ProxyTestResult(
+                proxy_hash=proxy.proxy_hash,
+                success=False,
+                reason=TestResultReasons.INVALID_URI,
+                kind=TestResultKind.CIDR,
+            )
+        )
 
+    host = find_key_nonrecursive(outbound, "address")
+    if not host:
+        raise Exception("No host address found in config")
 
-def _chunked_candidates(candidates: list[CandidateProxy], chunk_size: int):
-    for index in range(0, len(candidates), chunk_size):
-        yield candidates[index : index + chunk_size]
-
-
-def _latency_value(value: float | None) -> float:
-    return value if value is not None else 10**9
-
-
-async def _fetch_candidates(
-    config: AppConfig, db: Database, probe: ProxyProbe
-) -> list[CandidateProxy]:
-    seeded: dict[str, CandidateProxy] = {}
-    for row in db.get_recent_all(config.target_final_count):
-        seeded[row["proxy_hash"]] = CandidateProxy.from_row(row)
-    LOGGER.info("Seeded from recent selected: %s", len(seeded))
-
-    for row in db.get_recent_url_ok(config.target_final_count * 5):
-        seeded[row["proxy_hash"]] = CandidateProxy.from_row(row)
-    LOGGER.info("Seeded with URL cache total: %s", len(seeded))
-
-    source_urls = list(config.subscription_urls)
-    LOGGER.info("Loaded %s source URLs from config", len(source_urls))
-
-    fresh = await collect_candidates(source_urls, db, probe.toolchain)
-    LOGGER.info("Collected fresh candidates: %s", len(fresh))
-
-    fresh_by_hash = {item.proxy_hash: item for item in fresh}
-    alive_hashes = db.get_alive_hashes(list(fresh_by_hash.keys()))
-    skipped_dead = len(fresh_by_hash) - len(alive_hashes)
-
-    upsert_rows = []
-    for proxy_hash in alive_hashes:
-        c = fresh_by_hash[proxy_hash]
-        seeded[c.proxy_hash] = c
-        upsert_rows.append((c.proxy_hash, c.raw_link, c.scheme))
-
-    db.upsert_proxies(upsert_rows)
-    LOGGER.info(
-        "Added fresh alive candidates: %s (skipped dead=%s)", len(seeded), skipped_dead
+    success = await cidr_reader.filter(host)
+    return result_writer.add(
+        ProxyTestResult(
+            proxy_hash=proxy.proxy_hash,
+            success=success,
+            reason=TestResultReasons.OK if success else TestResultReasons.CIDR_DISCARDED,
+            kind=TestResultKind.CIDR,
+        )
     )
 
-    return list(seeded.values())
+
+async def _cidr_filter_stage(
+    config: CIDRConfig,
+    db: Database,
+    toolchain: XrayToolchain,
+    candidates_count: int,
+) -> None:
+    LOGGER.debug("CIDR filtering started")
+
+    cidr_reader = CIDRReader(config)
+    cidr_reader.ensure_cidr_reader()
+
+    candidate_reader = BatchCandidateReader(db, toolchain, 100)
+    result_writer = BatchTestResultWriter(db, 1000)
+
+    tasks = set()
+
+    async for proxy, outbound in tqdm_asyncio(
+        candidate_reader, total=candidates_count, desc="CIDR-test", mininterval=2
+    ):
+        task = asyncio.create_task(
+            _cidr_filter_one(proxy, outbound, cidr_reader, result_writer)
+        )
+        tasks.add(task)
+
+        if len(tasks) >= 50:
+            _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+    if tasks:
+        await tqdm_asyncio.gather(*tasks, desc="Ending CIDR-test", mininterval=2)
+
+    await cidr_reader.close()
+    result_writer.flush()
 
 
 async def _url_test_stage(
-    config: AppConfig, db: Database, probe: ProxyProbe, candidates: list[CandidateProxy]
-) -> list[tuple[float, CandidateProxy]]:
-    url_stream_chunk_size = max(config.url_batch_size * 4, config.url_batch_size)
-    top_for_speed: list[tuple[float, CandidateProxy]] = []
-    dead_after_url: list[tuple[str, str]] = []
-    dead_flush_size = 1000
-    total_url_ok = 0
-    total_url_fail = 0
+    config: AppConfig, db: Database, toolchain: XrayToolchain, candidates_count: int
+) -> None:
+    LOGGER.debug("URL test starting")
+    orchestrator = XrayOrchestrator(
+        toolchain,
+        config.tester.url_test.worker_count,
+        config.tester.url_test.worker_tasks_count,
+    )
 
-    for candidate_chunk in _chunked_candidates(candidates, url_stream_chunk_size):
-        url_results = await probe.url_test_batch(
-            candidate_chunk,
-            config.url_test_url,
-            config.url_timeout_seconds,
-            config.test_attempts,
-            config.url_batch_size,
+    candidate_reader = BatchCandidateReader(db, toolchain, 100)
+    result_writer = BatchTestResultWriter(db, 1000)
+
+    geoip_reader: GeoIPReader | None = None
+    if config.filter.geoip:
+        geoip_reader = GeoIPReader(config.filter.geoip)
+        geoip_reader.ensure_geoip_database()
+
+    proxy_tester = ProxyTester(result_writer, orchestrator)
+    await orchestrator.start()
+    tasks = set()
+
+    max_tasks = (
+        config.tester.url_test.worker_count * config.tester.url_test.worker_tasks_count
+    )
+    async for proxy, outbound in tqdm_asyncio(
+        candidate_reader, total=candidates_count, desc="URL-test", mininterval=2
+    ):
+        task = asyncio.create_task(
+            proxy_tester.url_test_proxy(
+                geoip_reader, proxy, outbound, config.tester)
         )
-        db.mark_url_results(url_results)
+        tasks.add(task)
 
-        by_hash_link = {
-            candidate.proxy_hash: candidate.raw_link for candidate in candidate_chunk
-        }
-        for res in url_results:
-            if len(dead_after_url) >= dead_flush_size:
-                db.mark_dead_many(dead_after_url, ttl_days=config.dead_ttl_days)
-                dead_after_url.clear()
+        if len(tasks) >= max_tasks:
+            _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
-            # Filtering
-            in_excluded_country = res.country in config.exclude_countries
-            if not res.success or in_excluded_country:
-                total_url_fail += 1
-                reason = (
-                    "excluded_country"
-                    if in_excluded_country
-                    else (res.reason or "url_test_failed")
-                )
-                dead_after_url.append((res.proxy_hash, reason))
-                continue
+    if tasks:
+        await tqdm_asyncio.gather(*tasks, desc="Ending URL-test", mininterval=2)
 
-            raw_link = by_hash_link.get(res.proxy_hash)
-            if raw_link is None:
-                continue
+    result_writer.flush()
+    await orchestrator.stop()
 
-            total_url_ok += 1
-            top_for_speed.append(
-                (
-                    _latency_value(res.latency_ms),
-                    CandidateProxy(res.proxy_hash, raw_link, "selected"),
-                )
+
+async def _speed_test_stage(
+    config: AppConfig,
+    db: Database,
+    toolchain: XrayToolchain,
+    stop_controller: StopController,
+    candidates_count: int,
+) -> None:
+    LOGGER.debug("Speed test starting")
+    orchestrator = XrayOrchestrator(
+        toolchain,
+        config.tester.speed_test.worker_count,
+        config.tester.speed_test.worker_tasks_count,
+    )
+
+    candidate_reader = BatchCandidateReader(db, toolchain, 100)
+    result_writer = BatchTestResultWriter(db, 100)
+
+    proxy_tester = ProxyTester(result_writer, orchestrator)
+    await orchestrator.start()
+    tasks: set[asyncio.Task] = set()
+
+    max_tasks = (
+        config.tester.speed_test.worker_count
+        * config.tester.speed_test.worker_tasks_count
+    )
+
+    pbar = tqdm(total=stop_controller.target, mininterval=2, desc="Speed test")
+
+    async for proxy, outbound in candidate_reader:
+        if (delta := stop_controller.success - pbar.n) > 0:
+            pbar.update(delta)
+
+        if stop_controller.should_stop():
+            break
+
+        task = asyncio.create_task(
+            proxy_tester.speed_test_proxy(
+                proxy, outbound, stop_controller, config.tester
             )
+        )
+        tasks.add(task)
 
-    if dead_after_url:
-        db.mark_dead_many(dead_after_url, ttl_days=config.dead_ttl_days)
+        if len(tasks) >= max_tasks:
+            _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if stop_controller.should_stop():
+                break
+    
+    pbar.n = stop_controller.success
+    pbar.refresh()
+    pbar.close()
+    
+    if tasks:
+        if stop_controller.should_stop():
+            LOGGER.debug("Speed test target count reached")
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            await tqdm_asyncio.gather(*tasks, desc="Finishing speed test", mininterval=2)
+    
+    await orchestrator.stop()
+    result_writer.flush()
 
-    LOGGER.info("URL stage complete: ok=%s fail=%s", total_url_ok, total_url_fail)
 
-    return top_for_speed
-
-
-async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> None:
+async def run_once(config: AppConfig, db: Database, toolchain: XrayToolchain) -> None:
     start_time = time.perf_counter()
 
     LOGGER.info("Initializing DB schema")
@@ -132,70 +203,47 @@ async def run_once(config: AppConfig, db: Database, probe: ProxyProbe) -> None:
     cleaned = db.cleanup_expired_dead()
     LOGGER.info("Expired dead proxies cleaned: %s", cleaned)
 
-    candidates = await _fetch_candidates(config, db, probe)
+    fresh_candidates_count = await fetch_candidates(config, db, toolchain)
 
-    if not candidates:
-        LOGGER.warning("No candidates available after seeding/collecting")
-        db.store_selected([])
-        write_export(config.export_file, db)
-        return
+    candidates_count = db.count_candidate_proxies()
+    LOGGER.info(
+        "Starting tests. total_candidates=%s fresh=%s",
+        candidates_count,
+        fresh_candidates_count,
+    )
 
-    candidates_count = len(candidates)
+    # Tests
 
-    LOGGER.info("Starting URL test stage. total_candidates=%s", candidates_count)
+    if config.filter.cidr:
+        LOGGER.info("Selected for cidr stage: %s", candidates_count)
 
-    top_for_speed = await _url_test_stage(config, db, probe, candidates)
+        await _cidr_filter_stage(config.filter.cidr, db, toolchain, candidates_count)
 
-    speed_candidates = [entry[1] for entry in sorted(top_for_speed, key=lambda x: x[0])]
+        db.move_dead_proxies(config.tester.dead_ttl_days)
+        candidates_count = db.count_candidate_proxies()
 
-    LOGGER.info("Selected for speed stage: %s", len(speed_candidates))
+    LOGGER.info("Selected for url stage: %s", candidates_count)
+    await _url_test_stage(config, db, toolchain, candidates_count)
 
-    final_selection: list[str] = []
-    dead_after_speed: list[tuple[str, str]] = []
-    total_speed_ok = 0
-    last_index = 0
-    while total_speed_ok < config.target_final_count and (last_index + 1) < len(
-        speed_candidates
-    ):
-        speed_test_chunk_size = min(
-            len(speed_candidates) - (last_index + 1), config.speed_batch_size
-        )
+    if config.filter.geoip:
+        db.geoip_filter_proxies(config.filter.geoip)
 
-        next_speed_candidates, last_index = _take_candidates(
-            speed_candidates, last_index, speed_test_chunk_size * 4
-        )
+    db.move_dead_proxies(config.tester.dead_ttl_days)
 
-        speed_results = await probe.speed_test_batch(
-            next_speed_candidates,
-            config.speed_test_url,
-            config.url_timeout_seconds,
-            config.speed_timeout_seconds,
-            config.test_attempts,
-            config.speed_batch_size,
-        )
+    speed_candidates_count = db.count_candidate_proxies()
+    LOGGER.info("Selected for speed stage: %s", speed_candidates_count)
 
-        db.mark_speed_results(speed_results)
+    stop_controller = StopController(config.tester.target_final_count)
+    await _speed_test_stage(
+        config, db, toolchain, stop_controller, speed_candidates_count
+    )
+    db.move_dead_proxies(config.tester.dead_ttl_days)
 
-        for res in speed_results:
-            if not res.success:
-                dead_after_speed.append(
-                    (res.proxy_hash, res.reason or "speed_test_failed")
-                )
-                continue
-            if (res.mbps or 0.0) < config.speed_min_mb_s:
-                dead_after_speed.append((res.proxy_hash, "below_speed_threshold"))
-                continue
+    final_selection_count = db.count_candidate_proxies_with_status("speed_ok")
 
-            total_speed_ok += 1
-            final_selection.append(res.proxy_hash)
+    LOGGER.info("Final selection size: %s", final_selection_count)
 
-            if total_speed_ok == config.target_final_count:
-                break
-
-    db.mark_dead_many(dead_after_speed, ttl_days=config.dead_ttl_days // 2)
-
-    LOGGER.info("Final selection size: %s", len(final_selection))
-    db.store_selected(final_selection)
+    db.store_selected(config.tester.target_final_count)
 
     end_time = time.perf_counter()
 

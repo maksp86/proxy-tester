@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import flag
 
-from .db import Database, utc_now
+from .db import Database
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def strip_existing_comment(link: str) -> str:
@@ -43,7 +48,7 @@ def render_link_with_comment(raw_link: str, comment: str) -> str:
 
 def write_export(path: Path, db: Database, info: dict[str, Any] | None = None) -> None:
     lines: list[str] = []
-    for item in db.get_recent_selected():
+    for item in db.get_selected():
         comment = format_comment(
             exit_ip=item["exit_ip"],
             city=item["city"],

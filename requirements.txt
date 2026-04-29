@@ -3,3 +3,4 @@ aiodns
 geoip2
 tqdm
 emoji-country-flag
+pydantic

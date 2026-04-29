@@ -1,121 +1,216 @@
 from __future__ import annotations
 
-import json
-import logging
-from dataclasses import asdict, dataclass
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    field_validator,
+    model_validator,
+)
+
+_TIMEOUT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s|m)?\s*$", re.IGNORECASE)
 
 
-@dataclass(frozen=True)
-class AppConfig:
-    """Application runtime settings loaded from JSON.
+def parse_timeout(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        if value <= 0:
+            raise ValueError("timeout must be > 0")
+        return float(value)
 
-    Attributes:
-        db_path: SQLite database file path.
-        export_file: Output file path for selected proxies.
-        subscription_urls: Subscription endpoints used for candidate collection.
-        geoip_db_path: Local GeoIP database path (`.mmdb`).
-        geoip_db_url: Optional URL for downloading `geoip_db_path` at startup.
-        url_batch_size: Maximum concurrent URL tests (rolling window).
-        url_timeout_seconds: Timeout for URL reachability checks.
-        url_test_attempts: Number of URL-test attempts per proxy (best latency wins).
-        url_urls: Candidate healthcheck URLs; first URL is used as probe target.
-        speed_top_n: Number of lowest-latency proxies to include in speed stage.
-        speed_batch_size: Maximum concurrent speed tests (rolling window).
-        speed_timeout_seconds: Timeout for speed checks.
-        speed_min_mb_s: Minimum accepted download speed in MB/s.
-        speed_test_url: URL used for download speed checks.
-        target_final_count: Target number of exported proxies.
-        dead_ttl_days: How long failed proxies remain in dead-list.
-    """
+    if isinstance(value, str):
+        m = _TIMEOUT_RE.match(value)
+        if not m:
+            raise ValueError("timeout must look like 10, 10s, 500ms or 2m")
+
+        num = float(m.group(1))
+        if num <= 0:
+            raise ValueError("timeout must be > 0")
+
+        unit = (m.group(2) or "s").lower()
+        if unit == "ms":
+            return num / 1000.0
+        if unit == "m":
+            return num * 60.0
+        return num
+
+    raise TypeError("timeout must be a number or a string")
+
+
+def _non_empty_path(v: Any) -> Any:
+    if isinstance(v, str) and not v.strip():
+        raise ValueError("path must not be empty")
+    return v
+
+
+def _speed_test_url() -> HttpUrl:
+    return HttpUrl("http://cachefly.cachefly.net/10mb.test")
+
+
+def _url_test_url() -> HttpUrl:
+    return HttpUrl("https://www.gstatic.com/generate_204")
+
+
+def _geoip_url() -> HttpUrl:
+    return HttpUrl(
+        "https://github.com/P3TERX/GeoLite.mmdb/releases/download/2026.04.16/GeoLite2-City.mmdb"
+    )
+
+
+def _cidr_url() -> HttpUrl:
+    return HttpUrl(
+        "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/refs/heads/main/cidrwhitelist.txt"
+    )
+
+
+class SpeedTestConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: HttpUrl = Field(default_factory=_speed_test_url)
+    worker_count: int = 5
+    worker_tasks_count: int = 5
+    speed_threshold: float = 1
+    timeout: float = 10.0
+
+    @field_validator("timeout", mode="before")
+    @classmethod
+    def _parse_timeout(cls, v: Any) -> float:
+        return parse_timeout(v)
+
+    @field_validator("worker_count", "worker_tasks_count")
+    @classmethod
+    def _positive_int(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("must be > 0")
+        return v
+
+
+class UrlTestConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: HttpUrl = Field(default_factory=_url_test_url)
+    worker_count: int = 5
+    worker_tasks_count: int = 10
+    timeout: float = 2.0
+
+    @field_validator("timeout", mode="before")
+    @classmethod
+    def _parse_timeout(cls, v: Any) -> float:
+        return parse_timeout(v)
+
+    @field_validator("worker_count", "worker_tasks_count")
+    @classmethod
+    def _positive_int(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("must be > 0")
+        return v
+
+
+class TesterConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    speed_test: SpeedTestConfig = Field(default_factory=SpeedTestConfig)
+    url_test: UrlTestConfig = Field(default_factory=UrlTestConfig)
+    target_final_count: int = 25
+    test_attempts: int = 3
+    dead_ttl_days: int = 30
+
+    @field_validator("target_final_count", "test_attempts")
+    @classmethod
+    def _positive_int(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("must be > 0")
+        return v
+
+
+class GeoIPConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: HttpUrl = Field(default_factory=_geoip_url)
+    path: Path = Path("GeoLite2-City.mmdb")
+    method: Literal["exclude", "include"] = "exclude"
+    countries: list[str] = Field(default_factory=list)
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def _path_not_empty(cls, v: Any) -> Any:
+        return _non_empty_path(v)
+
+    @field_validator("countries", mode="before")
+    @classmethod
+    def _normalize_countries(cls, v: Any) -> list[str]:
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            return v
+        return [str(x).strip().upper() for x in v if str(x).strip()]
+
+
+class CIDRConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: HttpUrl | None = Field(default_factory=_cidr_url)
+    path: Path = Path("cidr.txt")
+    method: Literal["exclude", "include"] = "exclude"
+
+    # Each item is one resolver, and each resolver may contain one or more nameservers.
+    # Example:
+    # [
+    #   ["1.1.1.1", "1.0.0.1"],
+    #   ["8.8.8.8", "8.8.4.4"],
+    # ]
+    dns_nameservers_pool: list[list[str]] = [["8.8.8.8"]]
+    dns_cache_ttl: int = 60
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def _path_not_empty(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        return _non_empty_path(v)
+
+    @model_validator(mode="after")
+    def _require_url_or_path(self) -> "CIDRConfig":
+        if self.url is None and self.path is None:
+            raise ValueError("cidr must contain at least one of: url or path")
+        return self
+
+
+class FilterConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    geoip: GeoIPConfig | None = None
+    cidr: CIDRConfig | None = None
+
+    @field_validator("geoip", "cidr", mode="before")
+    @classmethod
+    def _empty_dict_to_none(cls, v: Any) -> Any:
+        return None if v == {} else v
+
+
+class AppConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
     db_path: Path = Path("proxy_pool.sqlite3")
     export_file: Path = Path("result.txt")
-    subscription_urls: tuple[str, ...] = ()
+    subscription_urls: list[HttpUrl] = Field(min_length=1)
 
-    # Local GeoIP settings (file-only lookups, no network API calls during resolution)
-    geoip_db_path: Path = Path("geoip/GeoLite2-City.mmdb")
-    geoip_db_url: str | None = None
+    tester: TesterConfig = Field(default_factory=TesterConfig)
+    filter: FilterConfig = Field(default_factory=FilterConfig)
 
-    # URL test settings
-    url_batch_size: int = 25
-    url_timeout_seconds: float = 1.0
-    test_attempts: int = 1
-    url_test_url: str = "https://www.gstatic.com/generate_204"
+    @field_validator("db_path", "export_file", mode="before")
+    @classmethod
+    def _path_not_empty(cls, v: Any) -> Any:
+        return _non_empty_path(v)
 
-    # Speed test settings
-    speed_top_n: int = 100
-    speed_batch_size: int = 25
-    speed_timeout_seconds: float = 10.0
-    speed_min_mb_s: float = 1.0
-    speed_test_url: str = "https://cachefly.cachefly.net/10mb.test"
+    @classmethod
+    def from_json_file(cls, file_path: str | Path) -> "AppConfig":
+        return cls.model_validate_json(Path(file_path).read_text(encoding="utf-8"))
 
-    # Output settings
-    target_final_count: int = 25
-
-    # Dead list TTL
-    dead_ttl_days: int = 30
-
-    exclude_countries: tuple[str, ...] = ()
-
-
-DEFAULT_CONFIG = AppConfig()
-_PATH_FIELDS = {"db_path", "export_file", "geoip_db_path"}
-_TUPLE_FIELDS = {"subscription_urls"}
-
-
-def _coerce_config_value(key: str, value: Any) -> Any:
-    """Convert raw JSON config value into the type expected by AppConfig."""
-
-    if key in _PATH_FIELDS and value is not None:
-        return Path(str(value))
-    if key in _TUPLE_FIELDS and value is not None:
-        if isinstance(value, (list, tuple)):
-            return tuple(str(item) for item in value)
-        return (str(value),)
-    return value
-
-
-def _read_config_payload(config_path: Path) -> dict[str, Any]:
-    """Read JSON config payload from disk.
-
-    Raises:
-        ValueError: If file extension is not `.json` or payload root is not an object.
-    """
-
-    suffix = config_path.suffix.lower()
-    if suffix != ".json":
-        raise ValueError(f"Unsupported config format '{suffix}'. Use .json")
-
-    payload = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("Config root must be an object/dictionary")
-    return payload
-
-
-def load_config(config_path: Path | None) -> AppConfig:
-    """Load JSON configuration and merge it over defaults.
-
-    Args:
-        config_path: Path to JSON config file. If `None`, returns defaults.
-    """
-
-    if config_path is None:
-        logging.debug("No --config provided. Using DEFAULT_CONFIG.")
-        return DEFAULT_CONFIG
-
-    resolved = config_path.expanduser().resolve()
-    logging.info("Loading configuration from %s", resolved)
-    payload = _read_config_payload(resolved)
-
-    data = asdict(DEFAULT_CONFIG)
-    for key, value in payload.items():
-        if key not in data:
-            logging.warning("Ignoring unknown config key: %s", key)
-            continue
-        data[key] = _coerce_config_value(key, value)
-
-    config = AppConfig(**data)
-    logging.debug("Configuration loaded: %s", config)
-    return config
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AppConfig":
+        return cls.model_validate(data)

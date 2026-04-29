@@ -112,6 +112,7 @@ class XrayToolchain:
     ) -> dict[str, dict[str, Any] | None]:
         cmd = [
             str(self._converter_path),
+            "--only-outbounds",
             "--input-json=-",
         ]
 

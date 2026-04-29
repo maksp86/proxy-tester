@@ -3,23 +3,10 @@ from __future__ import annotations
 import sqlite3
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .models import SpeedTestResult, Subscripton, UrlTestResult
-
-
-@dataclass
-class ProxyRecord:
-    proxy_hash: str
-    raw_link: str
-    scheme: str
-    last_status: str
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+from .config import GeoIPConfig
+from .models import CandidateProxy, ProxyTestResult, Subscripton
 
 
 class Database:
@@ -56,10 +43,11 @@ class Database:
                         proxy_hash TEXT PRIMARY KEY,
                         raw_link TEXT NOT NULL,
                         scheme TEXT NOT NULL,
-                        first_seen_at TEXT NOT NULL,
-                        last_seen_at TEXT NOT NULL,
-                        last_checked_at TEXT,
+                        first_seen_at INTEGER NOT NULL,
+                        last_seen_at INTEGER NOT NULL,
+                        last_checked_at INTEGER,
                         last_status TEXT NOT NULL DEFAULT 'unknown',
+                        reason TEXT NOT NULL DEFAULT 'unknown',
                         latency_ms REAL,
                         mbps REAL,
                         exit_ip TEXT,
@@ -72,8 +60,8 @@ class Database:
                         raw_link TEXT NOT NULL,
                         scheme TEXT NOT NULL,
                         reason TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        expires_at TEXT NOT NULL
+                        created_at INTEGER NOT NULL,
+                        expires_at INTEGER NOT NULL
                     ) WITHOUT ROWID;
 
                     CREATE INDEX IF NOT EXISTS idx_dead_proxy_expires
@@ -81,7 +69,7 @@ class Database:
 
                     CREATE TABLE IF NOT EXISTS selected_proxies (
                         proxy_hash TEXT PRIMARY KEY,
-                        selected_at TEXT NOT NULL,
+                        selected_at INTEGER NOT NULL,
                         raw_link TEXT NOT NULL,
                         latency_ms REAL,
                         mbps REAL,
@@ -97,251 +85,65 @@ class Database:
                     """)
 
     def cleanup_expired_dead(self) -> int:
-        now_iso = utc_now().isoformat()
         with self._write_lock:
             with self.connect() as conn:
                 cur = conn.execute(
-                    "DELETE FROM dead_proxies WHERE expires_at < ?",
-                    (now_iso,),
+                    "DELETE FROM dead_proxies WHERE expires_at < strftime('%s','now')"
                 )
                 return cur.rowcount
 
-    def upsert_proxy(self, proxy_hash: str, raw_link: str, scheme: str) -> None:
-        self.upsert_proxies([(proxy_hash, raw_link, scheme)])
-
-    def upsert_proxies(self, rows: list[tuple[str, str, str]]) -> None:
-        if not rows:
-            return
-        now_iso = utc_now().isoformat()
-        with self._write_lock:
-            with self.connect() as conn:
-                conn.executemany(
-                    """
-                    INSERT INTO proxies(proxy_hash, raw_link, scheme, first_seen_at, last_seen_at, last_status)
-                    VALUES (?, ?, ?, ?, ?, 'unknown')
-                    ON CONFLICT(proxy_hash) DO UPDATE SET
-                        raw_link = excluded.raw_link,
-                        scheme = excluded.scheme,
-                        last_seen_at = excluded.last_seen_at
-                    """,
-                    [(h, link, sch, now_iso, now_iso) for h, link, sch in rows],
-                )
-
-    def is_dead(self, proxy_hash: str) -> bool:
-        now_iso = utc_now().isoformat()
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM dead_proxies WHERE proxy_hash = ? AND expires_at > ?",
-                (proxy_hash, now_iso),
-            ).fetchone()
-            return row is not None
-
-    def get_alive_hashes(self, proxy_hashes: list[str]) -> set[str]:
-        if not proxy_hashes:
-            return set()
-
-        unique_hashes = list(dict.fromkeys(proxy_hashes))
-        now_iso = utc_now().isoformat()
-
-        with self.connect() as conn:
-            conn.execute("DROP TABLE IF EXISTS temp_hashes")
-            conn.execute("CREATE TEMP TABLE temp_hashes (proxy_hash TEXT)")
-
-            conn.executemany(
-                "INSERT INTO temp_hashes (proxy_hash) VALUES (?)",
-                [(proxy_hash,) for proxy_hash in unique_hashes],
-            )
-
-            rows = conn.execute(
-                """
-                SELECT d.proxy_hash
-                FROM dead_proxies d
-                INNER JOIN temp_hashes t ON d.proxy_hash = t.proxy_hash
-                WHERE d.expires_at > ?
-                """,
-                (now_iso,),
-            ).fetchall()
-
-            dead_hashes = {row["proxy_hash"] for row in rows}
-
-        return {
-            proxy_hash for proxy_hash in unique_hashes if proxy_hash not in dead_hashes
-        }
-
-    def mark_dead(self, proxy_hash: str, reason: str, ttl_days: int) -> None:
-        self.mark_dead_many([(proxy_hash, reason)], ttl_days=ttl_days)
-
-    def mark_dead_many(self, rows: list[tuple[str, str]], ttl_days: int) -> None:
-        if not rows:
-            return
-        now = utc_now()
-        created_at = now.isoformat()
-        expires_at = (now + timedelta(days=ttl_days)).isoformat()
-        hashes = [proxy_hash for proxy_hash, _ in rows]
-        placeholders = ",".join("?" for _ in hashes)
-
-        with self._write_lock:
-            with self.connect() as conn:
-                existing = conn.execute(
-                    f"SELECT proxy_hash, raw_link, scheme FROM proxies WHERE proxy_hash IN ({placeholders})",
-                    hashes,
-                ).fetchall()
-                by_hash = {
-                    row["proxy_hash"]: (row["raw_link"], row["scheme"])
-                    for row in existing
-                }
-
-                conn.executemany(
-                    """
-                    INSERT INTO dead_proxies(proxy_hash, raw_link, scheme, reason, created_at, expires_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(proxy_hash) DO UPDATE SET
-                        raw_link = excluded.raw_link,
-                        scheme = excluded.scheme,
-                        reason = excluded.reason,
-                        created_at = excluded.created_at,
-                        expires_at = excluded.expires_at
-                    """,
-                    [
-                        (
-                            proxy_hash,
-                            raw_link,
-                            scheme,
-                            reason,
-                            created_at,
-                            expires_at,
-                        )
-                        for proxy_hash, reason in rows
-                        for raw_link, scheme in [
-                            self._get_proxy_identity(by_hash, proxy_hash)
-                        ]
-                    ],
-                )
-                conn.executemany(
-                    "DELETE FROM proxies WHERE proxy_hash = ?",
-                    [(proxy_hash,) for proxy_hash in hashes],
-                )
-
-    @staticmethod
-    def _get_proxy_identity(
-        by_hash: dict[str, tuple[str, str]],
-        proxy_hash: str,
-    ) -> tuple[str, str]:
-        return by_hash.get(proxy_hash, ("", "unknown"))
-
-    def mark_url_results(self, rows: list[UrlTestResult]) -> None:
-        if not rows:
-            return
-        now_iso = utc_now().isoformat()
-        with self._write_lock:
-            with self.connect() as conn:
-                conn.executemany(
-                    """
-                    UPDATE proxies
-                       SET last_checked_at = ?,
-                           last_status = ?,
-                           latency_ms = ?,
-                           exit_ip = ?,
-                           country = ?,
-                           city = ?,
-                           mbps = NULL
-                     WHERE proxy_hash = ?
-                    """,
-                    [
-                        (
-                            now_iso,
-                            "url_ok" if row.success else "dead",
-                            row.latency_ms,
-                            row.exit_ip,
-                            row.country,
-                            row.city,
-                            row.proxy_hash,
-                        )
-                        for row in rows
-                    ],
-                )
-
-    def mark_speed_results(self, results: list[SpeedTestResult]) -> None:
+    def mark_results(self, results: list[ProxyTestResult]) -> None:
         if not results:
             return
-        now_iso = utc_now().isoformat()
+
+        sql = """
+        UPDATE proxies
+        SET last_checked_at = strftime('%s','now'),
+            last_status = ?,
+            latency_ms = COALESCE(?, latency_ms),
+            exit_ip    = COALESCE(?, exit_ip),
+            country    = COALESCE(?, country),
+            city       = COALESCE(?, city),
+            reason     = ?,
+            mbps       = COALESCE(?, mbps)
+        WHERE proxy_hash = ?
+        """
+        params = [
+            (
+                "dead" if not r.success else (r.kind.value + "_ok"),
+                r.latency_ms,
+                r.exit_ip,
+                r.country,
+                r.city,
+                r.reason.value,
+                r.mbps,
+                r.proxy_hash,
+            )
+            for r in results
+        ]
+
         with self._write_lock:
             with self.connect() as conn:
-                conn.executemany(
-                    """
-                    UPDATE proxies
-                       SET last_checked_at = ?,
-                           last_status = ?,
-                           mbps = ?
-                     WHERE proxy_hash = ?
-                    """,
-                    [
-                        (
-                            now_iso,
-                            "speed_ok" if res.success else "dead",
-                            res.mbps,
-                            res.proxy_hash,
-                        )
-                        for res in results
-                    ],
-                )
+                conn.executemany(sql, params)
 
-    def get_recent_selected(self) -> list[sqlite3.Row]:
+    def get_selected(self) -> list[sqlite3.Row]:
         with self.connect() as conn:
-            return conn.execute("""
-                SELECT s.*
-                FROM selected_proxies s
-                ORDER BY s.selected_at DESC
-                """).fetchall()
+            return conn.execute("SELECT * FROM selected_proxies").fetchall()
 
-    def get_recent_url_ok(self, limit: int) -> list[sqlite3.Row]:
-        with self.connect() as conn:
-            return conn.execute(
-                """
-                SELECT
-                  p.proxy_hash,
-                  p.raw_link,
-                  p.latency_ms,
-                  p.exit_ip,
-                  p.country,
-                  p.city
-                FROM proxies p
-                WHERE p.last_status IN ('url_ok', 'speed_ok')
-                ORDER BY p.latency_ms ASC, p.last_checked_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-
-    def get_recent_all(self, limit: int) -> list[sqlite3.Row]:
-        with self.connect() as conn:
-            return conn.execute("""
-                SELECT
-                  p.proxy_hash,
-                  p.raw_link,
-                  p.latency_ms,
-                  p.exit_ip,
-                  p.country,
-                  p.city
-                FROM proxies p
-                ORDER BY p.latency_ms ASC, p.last_checked_at DESC
-                """).fetchall()
-
-    def store_selected(self, selected: list[str]) -> None:
-        if not selected:
+    def store_selected(self, target_final_count: int) -> None:
+        if target_final_count <= 0:
             return
-        now_iso = utc_now().isoformat()
+
         with self._write_lock:
             with self.connect() as conn:
                 conn.execute("DELETE FROM selected_proxies")
 
-                placeholders = ",".join("?" for _ in selected)
-
-                query = f"""
+                query = """
                     INSERT INTO selected_proxies
                         (proxy_hash, selected_at, raw_link, latency_ms, mbps, exit_ip, country, city)
-                    SELECT proxy_hash,
-                        ? AS selected_at,
+                    SELECT
+                        proxy_hash,
+                        strftime('%s','now'),
                         raw_link,
                         latency_ms,
                         mbps,
@@ -349,11 +151,12 @@ class Database:
                         country,
                         city
                     FROM proxies
-                    WHERE proxy_hash IN ({placeholders})
+                    WHERE last_status = 'speed_ok'
+                    ORDER BY mbps DESC NULLS LAST
+                    LIMIT ?
                 """
 
-                params = [now_iso] + selected
-                conn.execute(query, params)
+                conn.execute(query, (target_final_count,))
 
     def get_subscription(self, link: str) -> Subscripton | None:
         if not link:
@@ -386,3 +189,192 @@ class Database:
                     """,
                     (subscription.link, subscription.last_data_hash),
                 )
+
+    def prepare_fresh_candidates_table(self) -> None:
+        """Создаёт (или пересоздаёт) временную таблицу для свежих кандидатов."""
+        with self._write_lock:
+            with self.connect() as conn:
+                conn.execute("DROP TABLE IF EXISTS temp_fresh_candidates;")
+                conn.execute("""
+                        CREATE TEMP TABLE temp_fresh_candidates (
+                            proxy_hash TEXT PRIMARY KEY,
+                            raw_link   TEXT NOT NULL,
+                            scheme     TEXT NOT NULL
+                        ) WITHOUT ROWID;
+                    """)
+
+    def insert_fresh_candidates_batch(self, data: list[CandidateProxy]) -> None:
+        """Вставляет батч во временную таблицу (автоматический dedup через PRIMARY KEY)."""
+        if not data:
+            return
+        with self._write_lock:
+            with self.connect() as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO temp_fresh_candidates VALUES (?, ?, ?)",
+                    [i.to_row() for i in data],
+                )
+
+    def merge_fresh_candidates_to_proxies(self) -> int:
+        """Сливает temp_fresh_candidates → proxies:
+        - пропускает dead_proxies
+        - для новых: first_seen_at = strftime('%s','now')
+        - для существующих: обновляет last_seen_at + raw_link/scheme
+        Возвращает количество обработанных живых прокси (новые + обновлённые).
+        """
+        with self._write_lock:
+            with self.connect() as conn:
+                conn.execute("""
+                    INSERT INTO proxies (
+                        proxy_hash, raw_link, scheme,
+                        first_seen_at, last_seen_at,
+                        last_checked_at, last_status, reason,
+                        latency_ms, mbps, exit_ip, country, city
+                    )
+                    SELECT
+                        t.proxy_hash,
+                        t.raw_link,
+                        t.scheme,
+                        COALESCE(p.first_seen_at, strftime('%s','now')) AS first_seen_at,
+                        strftime('%s','now')                            AS last_seen_at,
+                        p.last_checked_at,
+                        COALESCE(p.last_status, 'unknown')           AS last_status,
+                        COALESCE(p.reason, 'unknown')                AS reason,
+                        p.latency_ms,
+                        p.mbps,
+                        p.exit_ip,
+                        p.country,
+                        p.city
+                    FROM temp_fresh_candidates t
+                    LEFT JOIN proxies p ON p.proxy_hash = t.proxy_hash
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM dead_proxies d
+                        WHERE d.proxy_hash = t.proxy_hash
+                    )
+                    ON CONFLICT (proxy_hash) DO UPDATE SET
+                        last_seen_at = strftime('%s','now'),
+                        raw_link     = excluded.raw_link,
+                        scheme       = excluded.scheme;
+                """)
+
+                row = conn.execute("SELECT changes()").fetchone()
+                return row[0] if row else 0
+
+    def count_fresh_candidates(self) -> int:
+        with self._write_lock:
+            with self.connect() as conn:
+                num_fresh = conn.execute(
+                    "SELECT COUNT(*) FROM temp_fresh_candidates"
+                ).fetchone()[0]
+                return num_fresh
+
+    def cleanup_fresh_candidates_table(self) -> None:
+        """Удаляет временную таблицу."""
+        with self._write_lock:
+            with self.connect() as conn:
+                conn.execute("DROP TABLE IF EXISTS temp_fresh_candidates;")
+
+    def fetch_candidate_proxies_batch(
+        self,
+        limit: int,
+        after_proxy_hash: str | None = None,
+    ) -> list[CandidateProxy]:
+        with self._write_lock:
+            with self.connect() as conn:
+                if after_proxy_hash is None:
+                    cursor = conn.execute(
+                        """
+                        SELECT *
+                        FROM proxies
+                        ORDER BY proxy_hash
+                        LIMIT ?
+                        """,
+                        (limit,),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """
+                        SELECT *
+                        FROM proxies
+                        WHERE proxy_hash > ?
+                        ORDER BY proxy_hash
+                        LIMIT ?
+                        """,
+                        (after_proxy_hash, limit),
+                    )
+
+                return [CandidateProxy.from_row(row) for row in cursor.fetchall()]
+
+    def count_candidate_proxies(self) -> int:
+        with self._write_lock:
+            with self.connect() as conn:
+                num_fresh = conn.execute(
+                    "SELECT COUNT(*) FROM proxies").fetchone()[0]
+                return num_fresh
+
+    def count_candidate_proxies_with_status(self, status: str) -> int:
+        with self._write_lock:
+            with self.connect() as conn:
+                num_fresh = conn.execute(
+                    "SELECT COUNT(*) FROM proxies WHERE last_status = ?", (status,)
+                ).fetchone()[0]
+                return num_fresh
+
+    def move_dead_proxies(self, ttl_days: int) -> None:
+        with self._write_lock:
+            with self.connect() as conn:
+                cur = conn.cursor()
+                cur.execute(f"""
+                    INSERT INTO dead_proxies (
+                        proxy_hash, raw_link, scheme, reason, created_at, expires_at
+                    )
+                    SELECT
+                        p.proxy_hash,
+                        p.raw_link,
+                        p.scheme,
+                        COALESCE(p.reason, 'dead'),
+                        strftime('%s','now'),
+                        strftime('%s','now', '+{ttl_days} days')
+                    FROM proxies p
+                    WHERE p.last_status = 'dead'
+                    ON CONFLICT(proxy_hash) DO UPDATE SET
+                        expires_at = excluded.expires_at,
+                        reason = excluded.reason
+                """)
+
+                cur.execute("""
+                    DELETE FROM proxies
+                    WHERE last_status = 'dead'
+                """)
+
+                conn.commit()
+
+    def geoip_filter_proxies(self, geoip_config: GeoIPConfig):
+        if not geoip_config:
+            return
+
+        with self._write_lock:
+            with self.connect() as conn:
+                cur = conn.cursor()
+
+                country_placeholders = ",".join(
+                    "?" for _ in geoip_config.countries)
+                filter_mode = " " if geoip_config.method == "exclude" else " NOT "
+
+                sql = f"""
+                    UPDATE proxies
+                    SET last_status = 'dead',
+                        reason = 'discarded_filtering'
+                    WHERE
+                        last_status IN ('url_ok', 'speed_ok')
+
+                        AND (
+                            country IS NULL
+                            OR country{filter_mode}IN ({country_placeholders})
+                        )
+                """
+
+                params = (*geoip_config.countries,)
+
+                cur.execute(sql, params)
+                conn.commit()
