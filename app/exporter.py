@@ -4,6 +4,7 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import base64
 
 import flag
 
@@ -46,6 +47,28 @@ def render_link_with_comment(raw_link: str, comment: str) -> str:
         return clean
     return f"{clean}#{comment}"
 
+def _make_headers(config: ExportConfig, count: int, info: dict[str, Any] | None = None) -> dict[str, Any]:
+    headers: dict[str, Any] = dict()
+    headers["profile-title"] = "base64:" + \
+        base64.b64encode(config.title.encode()).decode("ascii")
+    headers["profile-update-interval"] = config.update_interval
+
+    if config.web_page_url:
+        headers["profile-web-page-url"] = config.web_page_url
+
+    if config.support_url:
+        headers["support-url"] = config.support_url
+
+    announce_text = f"Exported at {datetime.now().strftime('%H:%M:%S %d.%m.%Y')}\n"
+    announce_text += f"Count: {count}\n"
+    
+    if info is not None:
+        announce_text += f"Candidates processed: {info.get("candidates")}\n"
+
+    headers["announce"] = "base64:" + \
+        base64.b64encode(announce_text.encode()).decode("ascii")
+    
+    return headers
 
 def write_export(config: ExportConfig, db: Database, info: dict[str, Any] | None = None) -> None:
     lines: list[str] = []
@@ -59,12 +82,7 @@ def write_export(config: ExportConfig, db: Database, info: dict[str, Any] | None
         )
         lines.append(render_link_with_comment(item["raw_link"], comment))
 
-    export = f"#profile-title: {config.title}\n"
-    export += f"#profile-update-interval: {config.update_interval}\n"
-    
-    if config.web_page_url:
-        export += f"#profile-web-page-url: {config.web_page_url}\n"
-
+    export = "#" + "-" * 50 + "proxy-tester" + "-" * 50 + "\n"
     export += f"# Exported at {utc_now().isoformat()}\n"
     export += f"# Count: {len(lines)}\n"
 
@@ -79,4 +97,18 @@ def write_export(config: ExportConfig, db: Database, info: dict[str, Any] | None
         export += f"# Candidates processed: {info.get("candidates")}\n"
 
     export += "\n".join(lines) + ("\n" if lines else "")
+
+    headers = _make_headers(config, len(lines), info)
+
+    if not config.separate_headers_file:
+        headers_text = ""
+        for item in headers:
+            headers_text += f"#{item}: {headers[item]}\n"
+        export = headers_text + export
+    else:
+        headers_text = ""
+        for item in headers:
+            headers_text += f"add_header {item} \"{headers[item]}\";\n"
+        config.separate_headers_file.write_text(headers_text, encoding="utf-8")
+
     config.file.write_text(export, encoding="utf-8")

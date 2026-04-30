@@ -172,7 +172,11 @@ class ExportConfig(BaseModel):
     file: Path = Path("result.txt")
     title: str = "proxy-tester"
     update_interval: int = 24
+
+    separate_headers_file: Path | None = None
+
     web_page_url: HttpUrl | None = None
+    support_url: HttpUrl | None = None
 
 class FilterConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
