@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 import aiohttp
+from pydantic import HttpUrl
 
 from app.batch_operations import BatchTestResultWriter
 from app.config import TesterConfig
@@ -23,20 +24,64 @@ LOGGER = logging.getLogger(__name__)
 
 class ProxyTester:
     def __init__(
-        self, batch_writer: BatchTestResultWriter, orchestrator: XrayOrchestrator
+        self, batch_writer: BatchTestResultWriter, orchestrator: XrayOrchestrator, config: TesterConfig,
+        kind: TestResultKind
     ):
-        self.orchestrator = orchestrator
-        self.batch_writer = batch_writer
+        self._orchestrator = orchestrator
+        self._batch_writer = batch_writer
+        self._config = config
+        self._kind = kind
 
-    async def url_test_proxy(
+        if kind == TestResultKind.CIDR:
+            raise ValueError("Invalid test kind")
+
+        conn_limit = config.url_test.worker_count * config.url_test.worker_tasks_count
+        timeout = aiohttp.ClientTimeout(
+            total=max(self._config.url_test.timeout, 1.0))
+
+        if kind == TestResultKind.SPEED:
+            conn_limit = config.speed_test.worker_count * \
+                config.speed_test.worker_tasks_count
+
+            connect_timeout_s = max(self._config.url_test.timeout, 1.0)
+            download_timeout_s = max(self._config.speed_test.timeout, 1.0)
+
+            timeout = aiohttp.ClientTimeout(
+                connect=connect_timeout_s,
+                sock_connect=connect_timeout_s,
+                sock_read=connect_timeout_s,
+                total=connect_timeout_s * 2 + download_timeout_s,
+            )
+
+        self._connector = aiohttp.TCPConnector(
+            limit=conn_limit * config.test_attempts,
+            limit_per_host=config.test_attempts,
+            keepalive_timeout=timeout.total,
+            enable_cleanup_closed=True)
+
+        self._session = aiohttp.ClientSession(
+            connector=self._connector,
+            timeout=timeout)
+
+    async def test_proxy(self, candidate: CandidateProxy, outbound: dict[str, Any] | None, **kwargs):
+        if self._kind == TestResultKind.CIDR:
+            raise ValueError("Invalid test kind")
+        elif self._kind == TestResultKind.URL:
+            return await self._url_test_proxy(kwargs.get("geoip_reader"), candidate, outbound)
+        elif self._kind == TestResultKind.SPEED:
+            stop_controller = kwargs.get("stop_controller")
+            if not stop_controller:
+                raise KeyError("stop_controller was None")
+            return await self._speed_test_proxy(candidate, outbound, stop_controller)
+
+    async def _url_test_proxy(
         self,
         geoip_reader: GeoIPReader | None,
         candidate: CandidateProxy,
-        outbound: dict[str, Any] | None,
-        tester_config: TesterConfig,
+        outbound: dict[str, Any] | None
     ) -> None:
         if not outbound:
-            return self.batch_writer.add(
+            return self._batch_writer.add(
                 ProxyTestResult(
                     proxy_hash=candidate.proxy_hash,
                     success=False,
@@ -45,8 +90,8 @@ class ProxyTester:
                 )
             )
 
-        slot = await self.orchestrator.acquire_slot()
-        worker = self.orchestrator.get_worker(slot.worker_id)
+        slot = await self._orchestrator.acquire_slot()
+        worker = self._orchestrator.get_worker(slot.worker_id)
         LOGGER.debug(
             "Started test task on %s with %s", slot.inbound_tag, candidate.proxy_hash
         )
@@ -56,20 +101,21 @@ class ProxyTester:
                 outbound, candidate.proxy_hash, slot.inbound_tag
             ):
                 latency_ms: float | None = None
-                for _ in range(tester_config.test_attempts):
+                for _ in range(self._config.test_attempts):
                     ok, latency_result = await _http_probe_url(
+                        session=self._session,
                         http_proxy_port=slot.inbound_port,
-                        test_url=str(tester_config.url_test.url),
-                        timeout_s=tester_config.url_test.timeout,
+                        test_url=self._config.url_test.url
                     )
                     if not ok and latency_result == -1:
                         continue
 
                     if ok and latency_result is not None and latency_result != -1:
                         latency_ms = latency_result
+                        break
 
                 if latency_ms is None:
-                    return self.batch_writer.add(
+                    return self._batch_writer.add(
                         ProxyTestResult(
                             proxy_hash=candidate.proxy_hash,
                             success=False,
@@ -78,16 +124,13 @@ class ProxyTester:
                         )
                     )
 
-                exit_ip = await _resolve_exit_ip(
-                    http_proxy_port=slot.inbound_port,
-                    timeout_s=min(tester_config.url_test.timeout, 5.0),
-                )
+                exit_ip = await _resolve_exit_ip(self._session, slot.inbound_port)
                 if geoip_reader:
                     country, city = geoip_reader.geoip_lookup(exit_ip)
                 else:
                     country, city = None, None
 
-                return self.batch_writer.add(
+                return self._batch_writer.add(
                     ProxyTestResult(
                         proxy_hash=candidate.proxy_hash,
                         success=True,
@@ -105,7 +148,7 @@ class ProxyTester:
             reason = TestResultReasons.URL_FAIL
             if isinstance(e, ValueError):
                 reason = TestResultReasons.INVALID_URI
-            return self.batch_writer.add(
+            return self._batch_writer.add(
                 ProxyTestResult(
                     proxy_hash=candidate.proxy_hash,
                     success=False,
@@ -117,17 +160,16 @@ class ProxyTester:
             LOGGER.debug(
                 "Ended test task on %s with %s", slot.inbound_tag, candidate.proxy_hash
             )
-            await self.orchestrator.release_slot(slot)
+            await self._orchestrator.release_slot(slot)
 
-    async def speed_test_proxy(
+    async def _speed_test_proxy(
         self,
         candidate: CandidateProxy,
         outbound: dict[str, Any] | None,
-        stop_controller: StopController,
-        tester_config: TesterConfig,
+        stop_controller: StopController
     ):
         if not outbound:
-            return self.batch_writer.add(
+            return self._batch_writer.add(
                 ProxyTestResult(
                     proxy_hash=candidate.proxy_hash,
                     success=False,
@@ -136,8 +178,8 @@ class ProxyTester:
                 )
             )
 
-        slot = await self.orchestrator.acquire_slot()
-        worker = self.orchestrator.get_worker(slot.worker_id)
+        slot = await self._orchestrator.acquire_slot()
+        worker = self._orchestrator.get_worker(slot.worker_id)
         LOGGER.debug(
             "Started test task on %s with %s", slot.inbound_tag, candidate.proxy_hash
         )
@@ -147,15 +189,14 @@ class ProxyTester:
                 outbound, candidate.proxy_hash, slot.inbound_tag
             ):
                 speed_bps, size_download = None, None
-                for _ in range(tester_config.test_attempts):
+                for _ in range(self._config.test_attempts):
                     if stop_controller.should_stop():
                         return
 
                     speed_bps, size_download = await _http_probe_speed(
-                        slot.inbound_port,
-                        str(tester_config.speed_test.url),
-                        tester_config.url_test.timeout,
-                        tester_config.speed_test.timeout,
+                        session=self._session,
+                        http_proxy_port=slot.inbound_port,
+                        download_url=self._config.speed_test.url
                     )
                     if speed_bps is None and size_download is None:
                         continue
@@ -163,7 +204,7 @@ class ProxyTester:
                         break
 
                 if speed_bps is None:
-                    return self.batch_writer.add(
+                    return self._batch_writer.add(
                         ProxyTestResult(
                             proxy_hash=candidate.proxy_hash,
                             success=False,
@@ -173,12 +214,12 @@ class ProxyTester:
                     )
 
                 mbps = speed_bps * 8 / (1024 * 1024)
-                success = mbps > tester_config.speed_test.speed_threshold
+                success = mbps > self._config.speed_test.speed_threshold
 
                 if success:
                     await stop_controller.add_success()
 
-                return self.batch_writer.add(
+                return self._batch_writer.add(
                     ProxyTestResult(
                         proxy_hash=candidate.proxy_hash,
                         success=success,
@@ -198,7 +239,7 @@ class ProxyTester:
             if isinstance(e, ValueError):
                 reason = TestResultReasons.INVALID_URI
 
-            return self.batch_writer.add(
+            return self._batch_writer.add(
                 ProxyTestResult(
                     proxy_hash=candidate.proxy_hash,
                     success=False,
@@ -207,23 +248,25 @@ class ProxyTester:
                 )
             )
         finally:
-            await self.orchestrator.release_slot(slot)
+            await self._orchestrator.release_slot(slot)
             LOGGER.debug(
                 "Ended test task on %s with %s", slot.inbound_tag, candidate.proxy_hash
             )
 
+    async def stop(self):
+        await self._session.close()
+        await self._connector.close()
+
 
 async def _http_probe_url(
-    http_proxy_port: int, test_url: str, timeout_s: float
+    session: aiohttp.ClientSession,
+    http_proxy_port: int,
+    test_url: HttpUrl
 ) -> tuple[bool, float | None]:
-    timeout = aiohttp.ClientTimeout(total=max(timeout_s, 1.0))
     start = time.perf_counter()
     try:
-        async with aiohttp.ClientSession(
-            timeout=timeout, proxy=f"http://127.0.0.1:{http_proxy_port}"
-        ) as session:
-            async with session.get(test_url) as response:
-                await response.read()
+        async with session.get(test_url.encoded_string(), proxy=f"http://127.0.0.1:{http_proxy_port}") as response:
+            await response.read()
         latency_ms = (time.perf_counter() - start) * 1000
         return True, latency_ms
     except asyncio.CancelledError:
@@ -232,46 +275,40 @@ async def _http_probe_url(
         return False, -1 if isinstance(e, TimeoutError) else None
 
 
-async def _resolve_exit_ip(http_proxy_port: int, timeout_s: float) -> str | None:
-    timeout = aiohttp.ClientTimeout(total=max(timeout_s, 1.0))
-    try:
-        connector = aiohttp.TCPConnector(family=socket.AF_INET)
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector,
-            proxy=f"http://127.0.0.1:{http_proxy_port}",
-        ) as session:
-            async with session.get("http://ifconfig.me/ip") as response:
+async def _resolve_exit_ip(session: aiohttp.ClientSession, http_proxy_port: int) -> str | None:
+    tester_urls = ("http://ipv4.text.wtfismyip.com",
+                   "http://checkip.amazonaws.com",
+                   "http://ifconfig.me/ip",
+                   "http://ifconfig.io/ip",
+                   "http://icanhazip.com",
+                   "http://text.ipv4.myip.wtf")
+    for tester_url in tester_urls[:4]:
+        try:
+            async with session.get(tester_url,
+                                proxy=f"http://127.0.0.1:{http_proxy_port}",
+                                timeout=aiohttp.ClientTimeout(total=1)
+                                ) as response:
                 return (await response.text()).strip() or None
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        return None
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError as e:
+            pass
+        except Exception as exc:
+            pass
+    return None
 
 
 async def _http_probe_speed(
-    socks_port: int,
-    download_url: str,
-    connect_timeout_s: float,
-    download_timeout_s: float,
+    session: aiohttp.ClientSession,
+    http_proxy_port: int,
+    download_url: HttpUrl,
 ) -> tuple[float | None, int | None]:
-    connect_timeout_s = max(connect_timeout_s, 1.0)
-    timeout = aiohttp.ClientTimeout(
-        connect=max(connect_timeout_s, 1.0),
-        sock_connect=max(connect_timeout_s, 1.0),
-        sock_read=max(download_timeout_s, 1.0),
-        total=connect_timeout_s * 2 + download_timeout_s,
-    )
     bytes_downloaded = 0
     started = time.perf_counter()
-
     try:
-        async with aiohttp.ClientSession(
-            timeout=timeout, proxy=f"http://127.0.0.1:{socks_port}"
-        ) as session:
-            async with session.get(download_url) as response:
-                async for chunk in response.content.iter_chunked(8 * 1024):
-                    bytes_downloaded += len(chunk)
+        async with session.get(download_url.encoded_string(), proxy=f"http://127.0.0.1:{http_proxy_port}") as response:
+            async for chunk in response.content.iter_chunked(8 * 1024):
+                bytes_downloaded += len(chunk)
     except asyncio.CancelledError:
         raise
     except Exception:

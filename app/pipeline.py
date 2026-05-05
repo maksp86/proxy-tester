@@ -109,7 +109,10 @@ async def _url_test_stage(
         geoip_reader = GeoIPReader(config.filter.geoip)
         geoip_reader.ensure_geoip_database()
 
-    proxy_tester = ProxyTester(result_writer, orchestrator)
+    proxy_tester = ProxyTester(result_writer,
+                               orchestrator,
+                               config.tester,
+                               kind=TestResultKind.URL)
     await orchestrator.start()
     tasks = set()
 
@@ -120,7 +123,8 @@ async def _url_test_stage(
         candidate_reader, total=candidates_count, desc="URL-test", mininterval=2
     ):
         task = asyncio.create_task(
-            proxy_tester.url_test_proxy(geoip_reader, proxy, outbound, config.tester)
+            proxy_tester.test_proxy(
+                proxy, outbound, geoip_reader=geoip_reader)
         )
         tasks.add(task)
 
@@ -131,6 +135,10 @@ async def _url_test_stage(
         await tqdm_asyncio.gather(*tasks, desc="Ending URL-test", mininterval=2)
 
     result_writer.flush()
+    
+    if geoip_reader:
+        geoip_reader.close()
+    await proxy_tester.stop()
     await orchestrator.stop()
 
 
@@ -138,8 +146,7 @@ async def _speed_test_stage(
     config: AppConfig,
     db: Database,
     toolchain: XrayToolchain,
-    stop_controller: StopController,
-    candidates_count: int,
+    stop_controller: StopController
 ) -> None:
     LOGGER.debug("Speed test starting")
     orchestrator = XrayOrchestrator(
@@ -151,7 +158,10 @@ async def _speed_test_stage(
     candidate_reader = BatchCandidateReader(db, toolchain, 100)
     result_writer = BatchTestResultWriter(db, 100)
 
-    proxy_tester = ProxyTester(result_writer, orchestrator)
+    proxy_tester = ProxyTester(result_writer,
+                               orchestrator,
+                               config.tester,
+                               TestResultKind.SPEED)
     await orchestrator.start()
     tasks: set[asyncio.Task] = set()
 
@@ -162,6 +172,8 @@ async def _speed_test_stage(
 
     pbar = tqdm(total=stop_controller.target, mininterval=2, desc="Speed test")
 
+    exhausted = False
+
     async for proxy, outbound in candidate_reader:
         if (delta := stop_controller.success - pbar.n) > 0:
             pbar.update(delta)
@@ -170,8 +182,10 @@ async def _speed_test_stage(
             break
 
         task = asyncio.create_task(
-            proxy_tester.speed_test_proxy(
-                proxy, outbound, stop_controller, config.tester
+            proxy_tester.test_proxy(
+                proxy,
+                outbound,
+                stop_controller=stop_controller
             )
         )
         tasks.add(task)
@@ -180,10 +194,17 @@ async def _speed_test_stage(
             _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             if stop_controller.should_stop():
                 break
+    else:
+        exhausted = True
 
-    pbar.n = stop_controller.success
+    if not exhausted:
+        pbar.n = stop_controller.success
+
     pbar.refresh()
     pbar.close()
+
+    if exhausted:
+        LOGGER.warning("Speed test target count not reached")
 
     if tasks:
         if stop_controller.should_stop():
@@ -196,8 +217,10 @@ async def _speed_test_stage(
                 *tasks, desc="Finishing speed test", mininterval=2
             )
 
+    await proxy_tester.stop()
     await orchestrator.stop()
     result_writer.flush()
+
 
 
 async def run_once(config: AppConfig, db: Database, toolchain: XrayToolchain) -> None:
@@ -240,7 +263,7 @@ async def run_once(config: AppConfig, db: Database, toolchain: XrayToolchain) ->
 
     stop_controller = StopController(config.tester.target_final_count)
     await _speed_test_stage(
-        config, db, toolchain, stop_controller, speed_candidates_count
+        config, db, toolchain, stop_controller
     )
     db.move_dead_proxies(config.tester.dead_ttl_days)
 

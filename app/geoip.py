@@ -17,12 +17,7 @@ class GeoIPReader:
         self._geoip_error: str | None = None
 
     def ensure_geoip_database(self) -> None:
-        """Ensure local GeoIP database exists.
-
-        Args:
-            geoip_db_path: Local destination path for `.mmdb`.
-            geoip_db_url: Optional download URL. If absent, no download is attempted.
-        """
+        """Ensure local GeoIP database exists."""
 
         if not self._config.url:
             LOGGER.debug("geoip_db_url is not set. Skipping GeoIP download.")
@@ -80,3 +75,8 @@ class GeoIPReader:
         country = city_record.country.iso_code or city_record.country.name
         city = city_record.city.name
         return country, city
+    
+    def close(self):
+        if self._geoip_reader:
+            self._geoip_reader.close()
+
