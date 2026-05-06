@@ -6,6 +6,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
+from itertools import batched
 
 from app.helpers import is_safe_xhttp_config
 from app.xray_backend import XrayToolchain
@@ -33,6 +34,15 @@ BASE_CONFIG: dict[str, Any] = {
     },
     "routing": {"domainStrategy": "AsIs", "rules": []},
     "inbounds": [],
+    "policy": {
+        "levels": {
+            "0": {
+                "connIdle": 5,
+                "uplinkOnly": 0,
+                "downlinkOnly": 0
+            }
+        }
+    }
 }
 
 BASE_INBOUND: dict[str, Any] = {
@@ -54,6 +64,8 @@ BASE_RULE: dict[str, Any] = {
 
 START_API_PORT = 10000
 START_INBOUND_PORT = 20000
+OUTBOUND_TTL_SECONDS = 60.0
+OUTBOUND_GC_INTERVAL_SECONDS = 5.0
 
 
 @dataclass
@@ -73,8 +85,10 @@ class XrayInstance:
         self._inbounds = inbounds
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
-        self._prev_rules: deque[dict] = deque(maxlen=5)
-        self._prev_outbounds: deque[dict] = deque(maxlen=5)
+        # self._prev_rules: deque[dict] = deque(maxlen=5)
+        # self._prev_outbounds: deque[dict] = deque(maxlen=5)
+        self._pending_outbound_cleanup: dict[str, float] = {}
+        self._last_cleanup_time: float = asyncio.get_running_loop().time()
 
     def _make_init_config(self) -> dict[str, Any]:
         config = copy.deepcopy(BASE_CONFIG)
@@ -123,6 +137,27 @@ class XrayInstance:
                 f"xray api call failed ({command}) code={proc.returncode}: {err or out}"
             )
 
+    async def _evict_expired_outbounds(self, force: bool = False) -> None:
+        now = asyncio.get_running_loop().time()
+        if now - self._last_cleanup_time < OUTBOUND_TTL_SECONDS:
+            return
+        self._last_cleanup_time = now
+
+        async with self._lock:
+            stale_tags = [
+                tag
+                for tag, expires_at in self._pending_outbound_cleanup.items()
+                if force or expires_at <= now
+            ]
+            
+            LOGGER.debug("Removing expired %s", stale_tags)
+
+            for batch in batched(stale_tags, 30):
+                await self._xray_api_call("rmo", None, list(batch))
+            
+            for tag in stale_tags:
+                self._pending_outbound_cleanup.pop(tag, None)
+
     async def start(self):
         self._proc = await asyncio.create_subprocess_exec(
             str(self._xray_path),
@@ -153,18 +188,25 @@ class XrayInstance:
 
     async def stop(self) -> None:
         if self._proc and self._proc.returncode is None:
-            self._proc.kill()
+            await self._evict_expired_outbounds(force=True)
+            self._proc.terminate()
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=10.0)
             except TimeoutError:
-                if self._proc.returncode is None:
-                    raise RuntimeError(f"Failed to kill xray at {self._api_port}.")
+                LOGGER.warning("Graceful stop timeout for xray at %s, killing", self._api_port)
+                self._proc.kill()
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=10.0)
+                except TimeoutError as exc:
+                    raise RuntimeError(f"Failed to stop xray at {self._api_port}.") from exc
             LOGGER.info("Stopped Xray instance at %s", self._api_port)
 
     @asynccontextmanager
     async def with_outbound(
         self, outbound: dict[str, Any], proxy_hash: str, inbound_tag: str
     ):
+        await self._evict_expired_outbounds()
+
         if not is_safe_xhttp_config(outbound):
             raise ValueError(
                 f"Config {outbound} at {inbound_tag} is not safe. Will ignore it."
@@ -173,16 +215,27 @@ class XrayInstance:
             try:
                 async with self._lock:
                     outbound["tag"] = f"proxy-{proxy_hash}"
+
+                    sockopt = {
+                        "tcpKeepAliveIdle": 10,
+                        "tcpKeepAliveInterval": 10
+                    }
+                    if "streamSettings" not in outbound:
+                        outbound["streamSettings"] = {}
+
+                    outbound["streamSettings"]["sockopt"] = sockopt
+
                     await self._xray_api_call("ado", {"outbounds": [outbound]})
 
                     rule = copy.deepcopy(BASE_RULE)
                     rule["routing"]["rules"][0]["ruleTag"] = f"rule-{proxy_hash}"
-                    rule["routing"]["rules"][0]["inboundTag"].append(inbound_tag)
+                    rule["routing"]["rules"][0]["inboundTag"].append(
+                        inbound_tag)
                     rule["routing"]["rules"][0]["outboundTag"] = outbound["tag"]
 
                     await self._xray_api_call("adrules", rule, ["-append"])
-                    self._prev_rules.append(rule)
-                    self._prev_outbounds.append(outbound)
+                    # self._prev_rules.append(rule)
+                    # self._prev_outbounds.append(outbound)
             except Exception as e:
                 if self._proc and self._proc.returncode:
                     stdout, stderr = await self._proc.communicate()
@@ -194,7 +247,10 @@ class XrayInstance:
         finally:
             async with self._lock:
                 await self._xray_api_call("rmrules", None, [f"rule-{proxy_hash}"])
-                await self._xray_api_call("rmo", None, [f"proxy-{proxy_hash}"])
+                self._pending_outbound_cleanup[f"proxy-{proxy_hash}"] = (
+                    asyncio.get_running_loop().time() + OUTBOUND_TTL_SECONDS
+                )
+                # await self._xray_api_call("rmo", None, [f"proxy-{proxy_hash}"])
 
 
 class XrayOrchestrator:
