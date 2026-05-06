@@ -195,6 +195,7 @@ class AppConfig(BaseModel):
 
     db_path: Path = Path("proxy_pool.sqlite3")
     subscription_urls: list[HttpUrl] = Field(min_length=1)
+    fetch_proxy: HttpUrl | None = None
 
     tester: TesterConfig = Field(default_factory=TesterConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)

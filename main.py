@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import urllib.request
 from pathlib import Path
 
 from app.config import AppConfig
@@ -36,6 +37,14 @@ async def _amain(verbose: bool, config_path: Path) -> None:
 
     setup_logging(verbose)
     cfg = AppConfig.from_json_file(config_path)
+
+    if cfg.fetch_proxy:
+        proxy = urllib.request.ProxyHandler({
+            'http': cfg.fetch_proxy.encoded_string(),
+            'https': cfg.fetch_proxy.encoded_string()
+            })
+        opener = urllib.request.build_opener(proxy)
+        urllib.request.install_opener(opener)
 
     db = Database(cfg.db_path)
     toolchain = XrayToolchain()

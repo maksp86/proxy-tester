@@ -147,12 +147,14 @@ class XrayToolchain:
 
 async def fetch_subscription_links(
     url: str,
+    proxy: str | None,
     timeout: float = 10.0,
 ) -> tuple[list[str], Subscripton]:
     timeout_cfg = aiohttp.ClientTimeout(total=timeout)
 
     async with aiohttp.ClientSession(
-        timeout=timeout_cfg, headers={"Accept": "text/plain,application/json,*/*"}
+        timeout=timeout_cfg, headers={"Accept": "text/plain,application/json,*/*"},
+        proxy=proxy
     ) as session:
         async with session.get(url) as response:
             response.raise_for_status()
