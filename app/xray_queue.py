@@ -38,8 +38,9 @@ BASE_CONFIG: dict[str, Any] = {
         "levels": {
             "0": {
                 "connIdle": 5,
-                "uplinkOnly": 0,
-                "downlinkOnly": 0
+                "uplinkOnly": 1,
+                "downlinkOnly": 1,
+                "handshake": 5
             }
         }
     }
@@ -48,7 +49,7 @@ BASE_CONFIG: dict[str, Any] = {
 BASE_INBOUND: dict[str, Any] = {
     "tag": "",
     "port": 0,
-    "listen": "127.0.0.1",
+    "listen": "127.0.0.90",
     "protocol": "http",
     "settings": {"allowTransparent": False},
 }
@@ -64,8 +65,8 @@ BASE_RULE: dict[str, Any] = {
 
 START_API_PORT = 10000
 START_INBOUND_PORT = 20000
-OUTBOUND_TTL_SECONDS = 60.0
-OUTBOUND_GC_INTERVAL_SECONDS = 5.0
+# OUTBOUND_TTL_SECONDS = 60.0
+# OUTBOUND_GC_INTERVAL_SECONDS = 5.0
 
 
 @dataclass
@@ -77,7 +78,7 @@ class XraySlot:
 
 class XrayInstance:
     def __init__(
-        self, toolchain: XrayToolchain, worker_id: int, inbounds: list[tuple[str, int]]
+        self, toolchain: XrayToolchain, worker_id: int, inbounds: dict[str, int]
     ) -> None:
         self._worker_id = worker_id
         self._api_port = START_API_PORT + worker_id
@@ -87,17 +88,17 @@ class XrayInstance:
         self._lock = asyncio.Lock()
         # self._prev_rules: deque[dict] = deque(maxlen=5)
         # self._prev_outbounds: deque[dict] = deque(maxlen=5)
-        self._pending_outbound_cleanup: dict[str, float] = {}
-        self._last_cleanup_time: float = asyncio.get_running_loop().time()
+        # self._pending_outbound_cleanup: dict[str, float] = {}
+        # self._last_cleanup_time: float = asyncio.get_running_loop().time()
 
     def _make_init_config(self) -> dict[str, Any]:
         config = copy.deepcopy(BASE_CONFIG)
-        config["api"]["listen"] = f"127.0.0.1:{self._api_port}"
+        config["api"]["listen"] = f"127.0.0.90:{self._api_port}"
 
-        for inb_tag, inb_port in self._inbounds:
+        for inb_tag in self._inbounds:
             inbound_config = copy.deepcopy(BASE_INBOUND)
             inbound_config["tag"] = inb_tag
-            inbound_config["port"] = inb_port
+            inbound_config["port"] = self._inbounds[inb_tag]
 
             config["inbounds"].append(inbound_config)
         return config
@@ -114,7 +115,7 @@ class XrayInstance:
             "api",
             command,
         ]
-        args.extend(["-s", f"127.0.0.1:{self._api_port}"])
+        args.extend(["-s", f"127.0.0.90:{self._api_port}"])
         if extra_args:
             args.extend(extra_args)
         proc = await asyncio.create_subprocess_exec(
@@ -137,26 +138,26 @@ class XrayInstance:
                 f"xray api call failed ({command}) code={proc.returncode}: {err or out}"
             )
 
-    async def _evict_expired_outbounds(self, force: bool = False) -> None:
-        now = asyncio.get_running_loop().time()
-        if now - self._last_cleanup_time < OUTBOUND_TTL_SECONDS:
-            return
-        self._last_cleanup_time = now
+    # async def _evict_expired_outbounds(self, force: bool = False) -> None:
+    #     now = asyncio.get_running_loop().time()
+    #     if now - self._last_cleanup_time < OUTBOUND_TTL_SECONDS:
+    #         return
+    #     self._last_cleanup_time = now
 
-        async with self._lock:
-            stale_tags = [
-                tag
-                for tag, expires_at in self._pending_outbound_cleanup.items()
-                if force or expires_at <= now
-            ]
-            
-            LOGGER.debug("Removing expired %s", stale_tags)
+    #     async with self._lock:
+    #         stale_tags = [
+    #             tag
+    #             for tag, expires_at in self._pending_outbound_cleanup.items()
+    #             if force or expires_at <= now
+    #         ]
 
-            for batch in batched(stale_tags, 30):
-                await self._xray_api_call("rmo", None, list(batch))
-            
-            for tag in stale_tags:
-                self._pending_outbound_cleanup.pop(tag, None)
+    #         LOGGER.debug("Removing expired %s", stale_tags)
+
+    #         for batch in batched(stale_tags, 30):
+    #             await self._xray_api_call("rmo", None, list(batch))
+
+    #         for tag in stale_tags:
+    #             self._pending_outbound_cleanup.pop(tag, None)
 
     async def start(self):
         self._proc = await asyncio.create_subprocess_exec(
@@ -188,24 +189,26 @@ class XrayInstance:
 
     async def stop(self) -> None:
         if self._proc and self._proc.returncode is None:
-            await self._evict_expired_outbounds(force=True)
+            # await self._evict_expired_outbounds(force=True)
             self._proc.terminate()
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=10.0)
             except TimeoutError:
-                LOGGER.warning("Graceful stop timeout for xray at %s, killing", self._api_port)
+                LOGGER.warning(
+                    "Graceful stop timeout for xray at %s, killing", self._api_port)
                 self._proc.kill()
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=10.0)
                 except TimeoutError as exc:
-                    raise RuntimeError(f"Failed to stop xray at {self._api_port}.") from exc
+                    raise RuntimeError(
+                        f"Failed to stop xray at {self._api_port}.") from exc
             LOGGER.info("Stopped Xray instance at %s", self._api_port)
 
     @asynccontextmanager
     async def with_outbound(
         self, outbound: dict[str, Any], proxy_hash: str, inbound_tag: str
     ):
-        await self._evict_expired_outbounds()
+        # await self._evict_expired_outbounds()
 
         if not is_safe_xhttp_config(outbound):
             raise ValueError(
@@ -217,15 +220,25 @@ class XrayInstance:
                     outbound["tag"] = f"proxy-{proxy_hash}"
 
                     sockopt = {
-                        "tcpKeepAliveIdle": 10,
-                        "tcpKeepAliveInterval": 10
+                        "tcpKeepAliveIdle": -1,
+                        "tcpKeepAliveInterval": -1,
+                        "tcpUserTimeout": 1000,
+                        "tcpFastOpen": False,
                     }
+
                     if "streamSettings" not in outbound:
                         outbound["streamSettings"] = {}
 
                     outbound["streamSettings"]["sockopt"] = sockopt
 
                     await self._xray_api_call("ado", {"outbounds": [outbound]})
+
+                    # inb
+                    # inbound_config = copy.deepcopy(BASE_INBOUND)
+                    # inbound_config["tag"] = inbound_tag
+                    # inbound_config["port"] = self._inbounds[inbound_tag]
+                    # await self._xray_api_call("adi", {"inbounds": [inbound_config]})
+                    # inb
 
                     rule = copy.deepcopy(BASE_RULE)
                     rule["routing"]["rules"][0]["ruleTag"] = f"rule-{proxy_hash}"
@@ -247,10 +260,11 @@ class XrayInstance:
         finally:
             async with self._lock:
                 await self._xray_api_call("rmrules", None, [f"rule-{proxy_hash}"])
-                self._pending_outbound_cleanup[f"proxy-{proxy_hash}"] = (
-                    asyncio.get_running_loop().time() + OUTBOUND_TTL_SECONDS
-                )
-                # await self._xray_api_call("rmo", None, [f"proxy-{proxy_hash}"])
+                # await self._xray_api_call("rmi", None, [inbound_tag])
+                await self._xray_api_call("rmo", None, [f"proxy-{proxy_hash}"])
+                # self._pending_outbound_cleanup[f"proxy-{proxy_hash}"] = (
+                #     asyncio.get_running_loop().time() + OUTBOUND_TTL_SECONDS
+                # )
 
 
 class XrayOrchestrator:
@@ -265,21 +279,18 @@ class XrayOrchestrator:
 
     async def start(self):
         for wid in range(self._num_workers):
-            inbounds = [
-                (
-                    f"inbound-{wid}-{i}",
-                    START_INBOUND_PORT + wid * self._tasks_per_worker + i,
-                )
+            inbounds = {
+                f"inbound-{wid}-{i}": START_INBOUND_PORT + wid * self._tasks_per_worker + i
                 for i in range(self._tasks_per_worker)
-            ]
+            }
 
             worker = XrayInstance(self._toolchain, wid, inbounds)
             await worker.start()
 
             self._workers.append(worker)
 
-            for tag, port in inbounds:
-                await self._slots.put(XraySlot(wid, tag, port))
+            for tag in inbounds:
+                await self._slots.put(XraySlot(wid, tag, inbounds[tag]))
 
     async def stop(self):
         await asyncio.gather(*(w.stop() for w in self._workers))

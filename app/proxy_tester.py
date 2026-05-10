@@ -56,8 +56,7 @@ class ProxyTester:
         self._connector = aiohttp.TCPConnector(
             limit=conn_limit * config.test_attempts,
             limit_per_host=config.test_attempts,
-            keepalive_timeout=timeout.total,
-            enable_cleanup_closed=True)
+            force_close=True)
 
         self._session = aiohttp.ClientSession(
             connector=self._connector,
@@ -265,7 +264,7 @@ async def _http_probe_url(
 ) -> tuple[bool, float | None]:
     start = time.perf_counter()
     try:
-        async with session.get(test_url.encoded_string(), proxy=f"http://127.0.0.1:{http_proxy_port}") as response:
+        async with session.get(test_url.encoded_string(), proxy=f"http://127.0.0.90:{http_proxy_port}") as response:
             await response.read()
         latency_ms = (time.perf_counter() - start) * 1000
         return True, latency_ms
@@ -285,7 +284,7 @@ async def _resolve_exit_ip(session: aiohttp.ClientSession, http_proxy_port: int)
     for tester_url in tester_urls[:4]:
         try:
             async with session.get(tester_url,
-                                proxy=f"http://127.0.0.1:{http_proxy_port}",
+                                proxy=f"http://127.0.0.90:{http_proxy_port}",
                                 timeout=aiohttp.ClientTimeout(total=1)
                                 ) as response:
                 return (await response.text()).strip() or None
@@ -306,7 +305,7 @@ async def _http_probe_speed(
     bytes_downloaded = 0
     started = time.perf_counter()
     try:
-        async with session.get(download_url.encoded_string(), proxy=f"http://127.0.0.1:{http_proxy_port}") as response:
+        async with session.get(download_url.encoded_string(), proxy=f"http://127.0.0.90:{http_proxy_port}") as response:
             async for chunk in response.content.iter_chunked(8 * 1024):
                 bytes_downloaded += len(chunk)
     except asyncio.CancelledError:
