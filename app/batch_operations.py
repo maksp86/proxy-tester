@@ -1,11 +1,11 @@
 import asyncio
 from collections import deque
 from threading import Lock
-from typing import Any, AsyncIterator, Deque
+from typing import Any, Deque, Iterable
 
+from app.binary_toolchain import BinaryToolchain
 from app.db import Database
 from app.models import CandidateProxy, ProxyTestResult
-from app.xray_backend import XrayToolchain
 
 
 class BatchTestResultWriter:
@@ -22,19 +22,27 @@ class BatchTestResultWriter:
             if len(self.buffer) >= self.batch_size:
                 self.flush()
 
+    def add_many(self, result: Iterable[ProxyTestResult]):
+        with self.lock:
+            self.buffer.extend(result)
+
+            if len(self.buffer) >= self.batch_size:
+                self.flush()
+
     def flush(self):
         if not self.buffer:
             return
 
         batch = self.buffer
-        self.buffer = []
 
         self._db.mark_results(batch)
+        self.buffer.clear()
+        self.buffer = []
 
 
 class BatchCandidateReader:
     def __init__(
-        self, db: Database, toolchain: XrayToolchain, prepare_batch_size: int
+        self, db: Database, toolchain: BinaryToolchain, prepare_batch_size: int
     ) -> None:
         self._db = db
         self._toolchain = toolchain
@@ -44,6 +52,10 @@ class BatchCandidateReader:
         self._lock = asyncio.Lock()
         self._last_proxy_hash: str | None = None
         self._finished = False
+        self.position = 0
+
+    def is_finished(self) -> bool:
+        return self._finished
 
     async def _fill_buffer(self) -> None:
         if self._finished:
@@ -63,10 +75,7 @@ class BatchCandidateReader:
         links = [p.raw_link for p in proxies]
         converted = await self._toolchain.convert_links(links)
 
-        for proxy in proxies:
-            outbound = converted.get(proxy.raw_link, None)
-
-            self._buffer.append((proxy, outbound))
+        self._buffer.extend((proxy, converted.get(proxy.raw_link)) for proxy in proxies)
 
     async def _ensure_buffer(self) -> None:
         if self._buffer or self._finished:
@@ -76,13 +85,19 @@ class BatchCandidateReader:
             if not self._buffer and not self._finished:
                 await self._fill_buffer()
 
-    def __aiter__(self) -> AsyncIterator[tuple[CandidateProxy, dict[str, Any] | None]]:
-        return self
+    async def take(self, n: int) -> list[tuple[CandidateProxy, dict[str, Any] | None]]:
+        output: list[tuple[CandidateProxy, dict[str, Any] | None]] = []
 
-    async def __anext__(self) -> tuple[CandidateProxy, dict[str, Any] | None]:
-        await self._ensure_buffer()
+        while n > 0:
+            await self._ensure_buffer()
+            if not self._buffer:
+                break
 
-        if not self._buffer:
-            raise StopAsyncIteration
+            take_now = min(n, len(self._buffer))
+            for _ in range(take_now):
+                async with self._lock:
+                    output.append(self._buffer.popleft())
+                    self.position += 1
+            n -= take_now
 
-        return self._buffer.popleft()
+        return output

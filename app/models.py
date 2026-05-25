@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -37,6 +38,15 @@ class TestResultReasons(Enum):
     SPEED_BELOW_THRESHOLD = "speed_below_threshold"
     CIDR_DISCARDED = "cidr_discarded"
 
+    @classmethod
+    def from_str(cls, value: str | None) -> "TestResultReasons":
+        if value is None:
+            return cls.UNKNOWN
+        try:
+            return cls(value)
+        except ValueError:
+            return cls.UNKNOWN
+
 
 class TestResultKind(str, Enum):
     URL = "url"
@@ -55,6 +65,22 @@ class ProxyTestResult:
     country: str | None = None
     city: str | None = None
     mbps: float | None = None
+
+    @classmethod
+    def from_dict(
+        cls, tag: str, kind: TestResultKind, data: dict[str, Any]
+    ) -> ProxyTestResult:
+        return cls(
+            proxy_hash=tag,
+            kind=kind,
+            success=data.get("result", False),
+            reason=TestResultReasons.from_str(data.get("reason")),
+            latency_ms=data.get("latency", None),
+            exit_ip=data.get("exit-ip", None),
+            country=data.get("country", None),
+            city=data.get("city", None),
+            mbps=data.get("speed", None),
+        )
 
 
 @dataclass(slots=True)

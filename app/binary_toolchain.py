@@ -22,23 +22,23 @@ from .models import Subscripton
 LOGGER = logging.getLogger(__name__)
 
 
-class XrayToolchain:
-    """Manages ProxyConverter and Xray-core binaries for local tests."""
+class BinaryToolchain:
+    """Manages ProxyConverter and proxy-tester binaries for local tests."""
 
     def __init__(self, project_root: Path | None = None) -> None:
         self._project_root = project_root or Path.cwd()
         self._bin_dir = self._project_root / ".bin"
-        xray_binary_name = "xray.exe" if _is_windows() else "xray"
+        tester_binary_name = "proxy-tester.exe" if _is_windows() else "proxy-tester"
         converter_binary_name = (
             "ProxyConverter.exe" if _is_windows() else "ProxyConverter"
         )
-        self._xray_path = self._bin_dir / "xray" / xray_binary_name
+        self._tester_path = self._bin_dir / "proxy-tester" / tester_binary_name
         self._converter_path = self._bin_dir / "proxyconverter" / converter_binary_name
 
     @property
     def xray_path(self) -> Path:
         self.ensure_xray()
-        return self._xray_path
+        return self._tester_path
 
     @property
     def converter_path(self) -> Path:
@@ -46,25 +46,25 @@ class XrayToolchain:
         return self._converter_path
 
     def ensure_xray(self) -> None:
-        if self._xray_path.exists():
+        if self._tester_path.exists():
             return
 
-        assets = _github_release_assets("XTLS", "Xray-core")
+        assets = _github_release_assets("maksp86", "xray-core-proxy-tester")
         archive_name = _select_xray_asset(assets)
         download_url = assets[archive_name]
 
-        target_dir = self._xray_path.parent
+        target_dir = self._tester_path.parent
         target_dir.mkdir(parents=True, exist_ok=True)
         archive_path = target_dir / archive_name
         _download_file(download_url, archive_path)
         _extract_zip(archive_path, target_dir)
         archive_path.unlink(missing_ok=True)
 
-        if not self._xray_path.exists():
+        if not self._tester_path.exists():
             raise RuntimeError(
-                f"Xray binary not found after extraction: {self._xray_path}"
+                f"Xray binary not found after extraction: {self._tester_path}"
             )
-        _mark_executable(self._xray_path)
+        _mark_executable(self._tester_path)
 
     def ensure_converter(self) -> None:
         if self._converter_path.exists():
@@ -153,8 +153,9 @@ async def fetch_subscription_links(
     timeout_cfg = aiohttp.ClientTimeout(total=timeout)
 
     async with aiohttp.ClientSession(
-        timeout=timeout_cfg, headers={"Accept": "text/plain,application/json,*/*"},
-        proxy=proxy
+        timeout=timeout_cfg,
+        headers={"Accept": "text/plain,application/json,*/*"},
+        proxy=proxy,
     ) as session:
         async with session.get(url) as response:
             response.raise_for_status()
@@ -233,22 +234,22 @@ def _select_xray_asset(assets: dict[str, str]) -> str:
     machine = platform.machine().lower()
     if system == "windows":
         if machine in {"x86_64", "amd64"}:
-            wanted = "Xray-windows-64.zip"
+            wanted = "proxy-tester-windows-x64.zip"
         elif machine in {"aarch64", "arm64"}:
-            wanted = "Xray-windows-arm64-v8a.zip"
+            wanted = "proxy-tester-windows-arm64.zip"
         else:
             raise RuntimeError(
-                f"Unsupported architecture for Xray-core on Windows: {machine}"
+                f"Unsupported architecture for proxy-tester on Windows: {machine}"
             )
     elif system in {"linux", "darwin"}:
         if machine in {"x86_64", "amd64"}:
-            wanted = "Xray-linux-64.zip"
+            wanted = "proxy-tester-linux-x64.zip"
         elif machine in {"aarch64", "arm64"}:
-            wanted = "Xray-linux-arm64-v8a.zip"
+            wanted = "proxy-tester-linux-arm64.zip"
         else:
-            raise RuntimeError(f"Unsupported architecture for Xray-core: {machine}")
+            raise RuntimeError(f"Unsupported architecture for proxy-tester: {machine}")
     else:
-        raise RuntimeError(f"Unsupported operating system for Xray-core: {system}")
+        raise RuntimeError(f"Unsupported operating system for proxy-tester: {system}")
 
     if wanted not in assets:
         raise RuntimeError(f"Xray asset {wanted} not found in latest release")

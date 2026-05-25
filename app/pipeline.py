@@ -9,17 +9,15 @@ from tqdm import tqdm
 from tqdm.asyncio import tqdm_asyncio
 
 from .batch_operations import BatchCandidateReader, BatchTestResultWriter
+from .binary_toolchain import BinaryToolchain
 from .cidr import CIDRReader
 from .config import AppConfig, CIDRConfig
 from .db import Database
 from .exporter import write_export
-from .geoip import GeoIPReader
 from .helpers import StopController, find_key_nonrecursive
 from .models import CandidateProxy, ProxyTestResult, TestResultKind, TestResultReasons
 from .proxy_tester import ProxyTester
 from .subscriptions import fetch_candidates
-from .xray_backend import XrayToolchain
-from .xray_queue import XrayOrchestrator
 
 LOGGER = logging.getLogger(__name__)
 
@@ -60,7 +58,7 @@ async def _cidr_filter_one(
 async def _cidr_filter_stage(
     config: CIDRConfig,
     db: Database,
-    toolchain: XrayToolchain,
+    toolchain: BinaryToolchain,
     candidates_count: int,
 ) -> None:
     LOGGER.debug("CIDR filtering started")
@@ -73,9 +71,10 @@ async def _cidr_filter_stage(
 
     tasks = set()
 
-    async for proxy, outbound in tqdm_asyncio(
-        candidate_reader, total=candidates_count, desc="CIDR-test", mininterval=2
-    ):
+    pbar = tqdm(total=candidates_count, mininterval=2, desc="CIDR test", unit="proxies")
+
+    while not candidate_reader.is_finished():
+        proxy, outbound = (await candidate_reader.take(1))[0]
         task = asyncio.create_task(
             _cidr_filter_one(proxy, outbound, cidr_reader, result_writer)
         )
@@ -83,128 +82,118 @@ async def _cidr_filter_stage(
 
         if len(tasks) >= 50:
             _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            pbar.n = candidate_reader.position
+            pbar.refresh()
+
+    pbar.close()
 
     if tasks:
-        await tqdm_asyncio.gather(*tasks, desc="Ending CIDR-test", mininterval=2)
+        await tqdm_asyncio.gather(
+            *tasks, desc="Ending CIDR-test", unit="tasks", mininterval=2
+        )
 
     await cidr_reader.close()
     result_writer.flush()
 
 
 async def _url_test_stage(
-    config: AppConfig, db: Database, toolchain: XrayToolchain, candidates_count: int
+    config: AppConfig, db: Database, toolchain: BinaryToolchain, candidates_count: int
 ) -> None:
     LOGGER.debug("URL test starting")
-    orchestrator = XrayOrchestrator(
-        toolchain,
-        config.tester.url_test.worker_count,
-        config.tester.url_test.worker_tasks_count,
-    )
-
-    candidate_reader = BatchCandidateReader(db, toolchain, 100)
-    result_writer = BatchTestResultWriter(db, 1000)
-
-    geoip_reader: GeoIPReader | None = None
-    if config.filter.geoip:
-        geoip_reader = GeoIPReader(config.filter.geoip)
-        geoip_reader.ensure_geoip_database()
-
-    proxy_tester = ProxyTester(result_writer,
-                               orchestrator,
-                               config.tester,
-                               kind=TestResultKind.URL)
-    await orchestrator.start()
-    tasks = set()
 
     max_tasks = (
         config.tester.url_test.worker_count * config.tester.url_test.worker_tasks_count
     )
-    async for proxy, outbound in tqdm_asyncio(
-        candidate_reader, total=candidates_count, desc="URL-test", mininterval=2
-    ):
+
+    candidate_reader = BatchCandidateReader(db, toolchain, max_tasks * 4)
+
+    result_writer = BatchTestResultWriter(db, 1000)
+
+    proxy_tester = ProxyTester(
+        result_writer, config.tester, TestResultKind.URL, toolchain, config.filter.geoip
+    )
+    tasks: set[asyncio.Task] = set()
+
+    pbar = tqdm(total=candidates_count, mininterval=2, desc="URL test", unit="proxies")
+
+    while not candidate_reader.is_finished():
         task = asyncio.create_task(
             proxy_tester.test_proxy(
-                proxy, outbound, geoip_reader=geoip_reader)
+                await candidate_reader.take(config.tester.url_test.worker_tasks_count)
+            )
         )
         tasks.add(task)
 
-        if len(tasks) >= max_tasks:
+        if len(tasks) >= config.tester.url_test.worker_count:
             _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            pbar.n = candidate_reader.position
+            pbar.refresh()
+
+    pbar.close()
 
     if tasks:
-        await tqdm_asyncio.gather(*tasks, desc="Ending URL-test", mininterval=2)
+        await tqdm_asyncio.gather(
+            *tasks, desc="Ending URL-test", unit="tasks", mininterval=2
+        )
 
     result_writer.flush()
-    
-    if geoip_reader:
-        geoip_reader.close()
-    await proxy_tester.stop()
-    await orchestrator.stop()
 
 
 async def _speed_test_stage(
     config: AppConfig,
     db: Database,
-    toolchain: XrayToolchain,
-    stop_controller: StopController
+    toolchain: BinaryToolchain,
+    stop_controller: StopController,
+    candidates_count: int,
 ) -> None:
-    LOGGER.debug("Speed test starting")
-    orchestrator = XrayOrchestrator(
-        toolchain,
-        config.tester.speed_test.worker_count,
-        config.tester.speed_test.worker_tasks_count,
-    )
-
-    candidate_reader = BatchCandidateReader(db, toolchain, 100)
-    result_writer = BatchTestResultWriter(db, 100)
-
-    proxy_tester = ProxyTester(result_writer,
-                               orchestrator,
-                               config.tester,
-                               TestResultKind.SPEED)
-    await orchestrator.start()
-    tasks: set[asyncio.Task] = set()
+    LOGGER.debug("URL test starting")
 
     max_tasks = (
-        config.tester.speed_test.worker_count
-        * config.tester.speed_test.worker_tasks_count
+        config.tester.url_test.worker_count * config.tester.url_test.worker_tasks_count
     )
 
-    pbar = tqdm(total=stop_controller.target, mininterval=2, desc="Speed test")
+    candidate_reader = BatchCandidateReader(db, toolchain, max_tasks * 4)
+
+    result_writer = BatchTestResultWriter(db, 100)
+
+    proxy_tester = ProxyTester(
+        result_writer, config.tester, TestResultKind.URL, toolchain, config.filter.geoip
+    )
+    tasks: set[asyncio.Task] = set()
+
+    pbar = tqdm(
+        total=candidates_count, mininterval=2, desc="Speed test", unit="proxies"
+    )
 
     exhausted = False
 
-    async for proxy, outbound in candidate_reader:
-        if (delta := stop_controller.success - pbar.n) > 0:
-            pbar.update(delta)
-
-        if stop_controller.should_stop():
-            break
-
+    while not candidate_reader.is_finished():
         task = asyncio.create_task(
             proxy_tester.test_proxy(
-                proxy,
-                outbound,
-                stop_controller=stop_controller
+                await candidate_reader.take(config.tester.url_test.worker_tasks_count)
             )
         )
         tasks.add(task)
 
-        if len(tasks) >= max_tasks:
-            _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if len(tasks) >= config.tester.url_test.worker_count:
+            res, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            await stop_controller.add_success(sum(r.result() for r in res))
+
+            pbar.n = candidate_reader.position
+            pbar.refresh()
+
             if stop_controller.should_stop():
                 break
     else:
-        exhausted = True
-
-    if not exhausted:
-        pbar.n = stop_controller.success
-
-    pbar.refresh()
-    pbar.close()
+        exhausted = not stop_controller.should_stop()
 
     if exhausted:
         LOGGER.warning("Speed test target count not reached")
+
+    if not exhausted:
+        pbar.n = stop_controller.success
+    pbar.refresh()
+    pbar.close()
 
     if tasks:
         if stop_controller.should_stop():
@@ -214,16 +203,13 @@ async def _speed_test_stage(
             await asyncio.gather(*tasks, return_exceptions=True)
         else:
             await tqdm_asyncio.gather(
-                *tasks, desc="Finishing speed test", mininterval=2
+                *tasks, desc="Finishing speed test", unit="tasks", mininterval=2
             )
 
-    await proxy_tester.stop()
-    await orchestrator.stop()
     result_writer.flush()
 
 
-
-async def run_once(config: AppConfig, db: Database, toolchain: XrayToolchain) -> None:
+async def run_once(config: AppConfig, db: Database, toolchain: BinaryToolchain) -> None:
     start_time = time.perf_counter()
 
     LOGGER.info("Initializing DB schema")
@@ -263,7 +249,7 @@ async def run_once(config: AppConfig, db: Database, toolchain: XrayToolchain) ->
 
     stop_controller = StopController(config.tester.target_final_count)
     await _speed_test_stage(
-        config, db, toolchain, stop_controller
+        config, db, toolchain, stop_controller, speed_candidates_count
     )
     db.move_dead_proxies(config.tester.dead_ttl_days)
 

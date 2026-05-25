@@ -1,319 +1,185 @@
 import asyncio
+import json
 import logging
-import socket
-import time
+import urllib.request
+from pathlib import Path
 from typing import Any
 
-import aiohttp
 from pydantic import HttpUrl
 
 from app.batch_operations import BatchTestResultWriter
-from app.config import TesterConfig
-from app.geoip import GeoIPReader
-from app.helpers import StopController
+from app.binary_toolchain import BinaryToolchain
+from app.config import GeoIPConfig, TesterConfig
 from app.models import (
     CandidateProxy,
     ProxyTestResult,
     TestResultKind,
     TestResultReasons,
 )
-from app.xray_queue import XrayOrchestrator
 
 LOGGER = logging.getLogger(__name__)
+
+IP_RESOLVER_URLS = (
+    "http://ipv4.text.wtfismyip.com",
+    "http://checkip.amazonaws.com",
+    "http://ifconfig.me/ip",
+    "http://ifconfig.io/ip",
+    "http://icanhazip.com",
+    "http://text.ipv4.myip.wtf",
+)
 
 
 class ProxyTester:
     def __init__(
-        self, batch_writer: BatchTestResultWriter, orchestrator: XrayOrchestrator, config: TesterConfig,
-        kind: TestResultKind
+        self,
+        batch_writer: BatchTestResultWriter,
+        config: TesterConfig,
+        kind: TestResultKind,
+        toolchain: BinaryToolchain,
+        geoip_config: GeoIPConfig | None = None,
     ):
-        self._orchestrator = orchestrator
+        self._toolchain = toolchain
         self._batch_writer = batch_writer
         self._config = config
         self._kind = kind
+        self._tester_args: list[str] = []
+
+        worker_count = 1
 
         if kind == TestResultKind.CIDR:
             raise ValueError("Invalid test kind")
 
-        conn_limit = config.url_test.worker_count * config.url_test.worker_tasks_count
-        timeout = aiohttp.ClientTimeout(
-            total=max(self._config.url_test.timeout, 1.0))
+        self._tester_args.append(f"--test-type={kind.value}")
+        self._tester_args.append(f"--retries={config.test_attempts}")
+        self._tester_args.append(
+            f"--connect-timeout={int(config.url_test.timeout * 1000)}"
+        )
+
+        if geoip_config and geoip_config.path and geoip_config.path.exists():
+            ensure_geoip_database(geoip_config.path, geoip_config.url)
+            self._tester_args.append(
+                f"--geoip2-db-path={geoip_config.path.resolve()}")
 
         if kind == TestResultKind.SPEED:
-            conn_limit = config.speed_test.worker_count * \
-                config.speed_test.worker_tasks_count
-
-            connect_timeout_s = max(self._config.url_test.timeout, 1.0)
-            download_timeout_s = max(self._config.speed_test.timeout, 1.0)
-
-            timeout = aiohttp.ClientTimeout(
-                connect=connect_timeout_s,
-                sock_connect=connect_timeout_s,
-                sock_read=connect_timeout_s,
-                total=connect_timeout_s * 2 + download_timeout_s,
+            worker_count = config.speed_test.worker_count
+            self._tester_args.append(f"--url={str(config.speed_test.url)}")
+            self._tester_args.append(
+                f"--parallelism={config.speed_test.worker_tasks_count}"
             )
+            self._tester_args.append(
+                f"--download-timeout={int(config.speed_test.timeout * 1000)}"
+            )
+            self._tester_args.append(
+                f"--min-speed-mbps={config.speed_test.speed_threshold}"
+            )
+        else:
+            worker_count = config.url_test.worker_count
+            self._tester_args.append(f"--url={str(config.url_test.url)}")
+            self._tester_args.append(
+                f"--parallelism={config.url_test.worker_tasks_count}"
+            )
+            self._tester_args.append(
+                f"--max-latency={int(config.url_test.timeout * 1000)}"
+            )
+            self._tester_args.append(
+                f"--exit-ip-url={",".join(IP_RESOLVER_URLS[:3])}")
 
-        self._connector = aiohttp.TCPConnector(
-            limit=conn_limit * config.test_attempts,
-            limit_per_host=config.test_attempts,
-            force_close=True)
+        self._semaphore = asyncio.Semaphore(worker_count)
 
-        self._session = aiohttp.ClientSession(
-            connector=self._connector,
-            timeout=timeout)
-
-    async def test_proxy(self, candidate: CandidateProxy, outbound: dict[str, Any] | None, **kwargs):
+    async def test_proxy(
+        self, data: list[tuple[CandidateProxy, dict[str, Any] | None]]
+    ) -> int:
         if self._kind == TestResultKind.CIDR:
             raise ValueError("Invalid test kind")
-        elif self._kind == TestResultKind.URL:
-            return await self._url_test_proxy(kwargs.get("geoip_reader"), candidate, outbound)
-        elif self._kind == TestResultKind.SPEED:
-            stop_controller = kwargs.get("stop_controller")
-            if not stop_controller:
-                raise KeyError("stop_controller was None")
-            return await self._speed_test_proxy(candidate, outbound, stop_controller)
 
-    async def _url_test_proxy(
-        self,
-        geoip_reader: GeoIPReader | None,
-        candidate: CandidateProxy,
-        outbound: dict[str, Any] | None
-    ) -> None:
-        if not outbound:
-            return self._batch_writer.add(
-                ProxyTestResult(
-                    proxy_hash=candidate.proxy_hash,
-                    success=False,
-                    reason=TestResultReasons.INVALID_URI,
-                    kind=TestResultKind.URL,
-                )
-            )
-
-        slot = await self._orchestrator.acquire_slot()
-        worker = self._orchestrator.get_worker(slot.worker_id)
-        LOGGER.debug(
-            "Started test task on %s with %s", slot.inbound_tag, candidate.proxy_hash
-        )
-
-        try:
-            async with worker.with_outbound(
-                outbound, candidate.proxy_hash, slot.inbound_tag
-            ):
-                latency_ms: float | None = None
-                for _ in range(self._config.test_attempts):
-                    ok, latency_result = await _http_probe_url(
-                        session=self._session,
-                        http_proxy_port=slot.inbound_port,
-                        test_url=self._config.url_test.url
-                    )
-                    if not ok and latency_result == -1:
-                        continue
-
-                    if ok and latency_result is not None and latency_result != -1:
-                        latency_ms = latency_result
-                        break
-
-                if latency_ms is None:
-                    return self._batch_writer.add(
+        async with self._semaphore:
+            tester_payload = []
+            for candidate, outbound in data:
+                if not outbound:
+                    self._batch_writer.add(
                         ProxyTestResult(
                             proxy_hash=candidate.proxy_hash,
                             success=False,
-                            reason=TestResultReasons.URL_FAIL,
-                            kind=TestResultKind.URL,
+                            reason=TestResultReasons.INVALID_URI,
+                            kind=self._kind,
                         )
                     )
+                    continue
+                outbound["tag"] = candidate.proxy_hash
+                tester_payload.append(outbound)
 
-                exit_ip = await _resolve_exit_ip(self._session, slot.inbound_port)
-                if geoip_reader:
-                    country, city = geoip_reader.geoip_lookup(exit_ip)
-                else:
-                    country, city = None, None
+            tester_out = await self.run_tester(tester_payload)
+            tester_payload.clear()
 
-                return self._batch_writer.add(
-                    ProxyTestResult(
-                        proxy_hash=candidate.proxy_hash,
-                        success=True,
-                        latency_ms=latency_ms,
-                        exit_ip=exit_ip,
-                        country=country,
-                        city=city,
-                        reason=TestResultReasons.OK,
-                        kind=TestResultKind.URL,
-                    )
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            reason = TestResultReasons.URL_FAIL
-            if isinstance(e, ValueError):
-                reason = TestResultReasons.INVALID_URI
-            return self._batch_writer.add(
-                ProxyTestResult(
-                    proxy_hash=candidate.proxy_hash,
-                    success=False,
-                    reason=reason,
-                    kind=TestResultKind.URL,
-                )
-            )
-        finally:
-            LOGGER.debug(
-                "Ended test task on %s with %s", slot.inbound_tag, candidate.proxy_hash
-            )
-            await self._orchestrator.release_slot(slot)
+            if not tester_out:
+                raise RuntimeError(f"Tester output was {tester_out}")
 
-    async def _speed_test_proxy(
-        self,
-        candidate: CandidateProxy,
-        outbound: dict[str, Any] | None,
-        stop_controller: StopController
-    ):
-        if not outbound:
-            return self._batch_writer.add(
-                ProxyTestResult(
-                    proxy_hash=candidate.proxy_hash,
-                    success=False,
-                    reason=TestResultReasons.INVALID_URI,
-                    kind=TestResultKind.SPEED,
-                )
+            success_count = sum(
+                1 if tester_out[outbound_tag]["result"] else 0
+                for outbound_tag in tester_out
             )
 
-        slot = await self._orchestrator.acquire_slot()
-        worker = self._orchestrator.get_worker(slot.worker_id)
-        LOGGER.debug(
-            "Started test task on %s with %s", slot.inbound_tag, candidate.proxy_hash
+            self._batch_writer.add_many(
+                ProxyTestResult.from_dict(
+                    outbound_tag, self._kind, tester_out[outbound_tag]
+                )
+                for outbound_tag in tester_out
+            )
+            tester_out.clear()
+            return success_count
+
+    async def run_tester(
+        self, tester_payload: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        proc = await asyncio.create_subprocess_exec(
+            str(self._toolchain.xray_path),
+            *self._tester_args,
+            cwd=self._toolchain.xray_path.parent,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
 
+        LOGGER.debug("Started tester on batch of %s proxies",
+                     len(tester_payload))
+
         try:
-            async with worker.with_outbound(
-                outbound, candidate.proxy_hash, slot.inbound_tag
-            ):
-                speed_bps, size_download = None, None
-                for _ in range(self._config.test_attempts):
-                    if stop_controller.should_stop():
-                        return
+            o, e = await proc.communicate(json.dumps(tester_payload).encode())
 
-                    speed_bps, size_download = await _http_probe_speed(
-                        session=self._session,
-                        http_proxy_port=slot.inbound_port,
-                        download_url=self._config.speed_test.url
-                    )
-                    if speed_bps is None and size_download is None:
-                        continue
-                    if speed_bps is not None and size_download is not None:
-                        break
-
-                if speed_bps is None:
-                    return self._batch_writer.add(
-                        ProxyTestResult(
-                            proxy_hash=candidate.proxy_hash,
-                            success=False,
-                            reason=TestResultReasons.SPEED_FAIL,
-                            kind=TestResultKind.SPEED,
-                        )
-                    )
-
-                mbps = speed_bps * 8 / (1024 * 1024)
-                success = mbps > self._config.speed_test.speed_threshold
-
-                if success:
-                    await stop_controller.add_success()
-
-                return self._batch_writer.add(
-                    ProxyTestResult(
-                        proxy_hash=candidate.proxy_hash,
-                        success=success,
-                        mbps=mbps,
-                        reason=(
-                            TestResultReasons.OK
-                            if success
-                            else TestResultReasons.SPEED_BELOW_THRESHOLD
-                        ),
-                        kind=TestResultKind.SPEED,
-                    )
+            if proc.returncode != 0:
+                print(" ".join(self._tester_args))
+                raise RuntimeError(
+                    f"Tester exited with code {proc.returncode}. Error was: '{e.decode()}'"
                 )
+
+            result = None
+            for line in o.decode().split("\n"):
+                line = line.strip()
+                if line.startswith("{"):
+                    result = json.loads(line)
+                    break
+
+            return result
         except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            reason = TestResultReasons.SPEED_FAIL
-            if isinstance(e, ValueError):
-                reason = TestResultReasons.INVALID_URI
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
 
-            return self._batch_writer.add(
-                ProxyTestResult(
-                    proxy_hash=candidate.proxy_hash,
-                    success=False,
-                    reason=reason,
-                    kind=TestResultKind.SPEED,
-                )
-            )
-        finally:
-            await self._orchestrator.release_slot(slot)
-            LOGGER.debug(
-                "Ended test task on %s with %s", slot.inbound_tag, candidate.proxy_hash
-            )
-
-    async def stop(self):
-        await self._session.close()
-        await self._connector.close()
+        return None
 
 
-async def _http_probe_url(
-    session: aiohttp.ClientSession,
-    http_proxy_port: int,
-    test_url: HttpUrl
-) -> tuple[bool, float | None]:
-    start = time.perf_counter()
-    try:
-        async with session.get(test_url.encoded_string(), proxy=f"http://127.0.0.90:{http_proxy_port}") as response:
-            await response.read()
-        latency_ms = (time.perf_counter() - start) * 1000
-        return True, latency_ms
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        return False, -1 if isinstance(e, TimeoutError) else None
+def ensure_geoip_database(geoip_path: Path, geoip_url: HttpUrl | None) -> None:
+    """Ensure local GeoIP database exists."""
 
+    if not geoip_url:
+        LOGGER.debug("geoip_db_url is not set. Skipping GeoIP download.")
+        return
 
-async def _resolve_exit_ip(session: aiohttp.ClientSession, http_proxy_port: int) -> str | None:
-    tester_urls = ("http://ipv4.text.wtfismyip.com",
-                   "http://checkip.amazonaws.com",
-                   "http://ifconfig.me/ip",
-                   "http://ifconfig.io/ip",
-                   "http://icanhazip.com",
-                   "http://text.ipv4.myip.wtf")
-    for tester_url in tester_urls[:4]:
-        try:
-            async with session.get(tester_url,
-                                proxy=f"http://127.0.0.90:{http_proxy_port}",
-                                timeout=aiohttp.ClientTimeout(total=1)
-                                ) as response:
-                return (await response.text()).strip() or None
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError as e:
-            pass
-        except Exception as exc:
-            pass
-    return None
-
-
-async def _http_probe_speed(
-    session: aiohttp.ClientSession,
-    http_proxy_port: int,
-    download_url: HttpUrl,
-) -> tuple[float | None, int | None]:
-    bytes_downloaded = 0
-    started = time.perf_counter()
-    try:
-        async with session.get(download_url.encoded_string(), proxy=f"http://127.0.0.90:{http_proxy_port}") as response:
-            async for chunk in response.content.iter_chunked(8 * 1024):
-                bytes_downloaded += len(chunk)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        return None, None
-
-    duration = time.perf_counter() - started
-    if duration <= 0:
-        return None, None
-    return bytes_downloaded / duration, bytes_downloaded
+    LOGGER.info(
+        "Downloading GeoIP DB from %s to %s",
+        geoip_url,
+        geoip_path,
+    )
+    geoip_path.parent.mkdir(parents=True, exist_ok=True)
+    urllib.request.urlretrieve(str(geoip_url), geoip_path)
+    LOGGER.info("GeoIP DB download complete: %s", geoip_path)

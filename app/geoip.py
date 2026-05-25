@@ -75,8 +75,7 @@ class GeoIPReader:
         country = city_record.country.iso_code or city_record.country.name
         city = city_record.city.name
         return country, city
-    
+
     def close(self):
         if self._geoip_reader:
             self._geoip_reader.close()
-

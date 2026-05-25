@@ -6,10 +6,10 @@ import logging
 import urllib.request
 from pathlib import Path
 
+from app.binary_toolchain import BinaryToolchain
 from app.config import AppConfig
 from app.db import Database
 from app.pipeline import run_once
-from app.xray_backend import XrayToolchain
 
 
 def setup_logging(verbose: bool) -> None:
@@ -39,15 +39,17 @@ async def _amain(verbose: bool, config_path: Path) -> None:
     cfg = AppConfig.from_json_file(config_path)
 
     if cfg.fetch_proxy:
-        proxy = urllib.request.ProxyHandler({
-            'http': cfg.fetch_proxy.encoded_string(),
-            'https': cfg.fetch_proxy.encoded_string()
-            })
+        proxy = urllib.request.ProxyHandler(
+            {
+                "http": cfg.fetch_proxy.encoded_string(),
+                "https": cfg.fetch_proxy.encoded_string(),
+            }
+        )
         opener = urllib.request.build_opener(proxy)
         urllib.request.install_opener(opener)
 
     db = Database(cfg.db_path)
-    toolchain = XrayToolchain()
+    toolchain = BinaryToolchain()
 
     logging.debug("Ensuring toolchain exists..")
     toolchain.ensure_converter()

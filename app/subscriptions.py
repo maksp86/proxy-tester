@@ -5,10 +5,10 @@ import logging
 import tqdm.asyncio
 from pydantic import HttpUrl
 
+from .binary_toolchain import BinaryToolchain, fetch_subscription_links
 from .config import AppConfig
 from .db import Database
 from .models import CandidateProxy
-from .xray_backend import XrayToolchain, fetch_subscription_links
 
 LOGGER = logging.getLogger(__name__)
 
@@ -30,23 +30,23 @@ def hash_link(link: str) -> str:
 
 
 async def fetch_candidates(
-    config: AppConfig, db: Database, toolchain: XrayToolchain
+    config: AppConfig, db: Database, toolchain: BinaryToolchain
 ) -> int:
     """Обновляет таблицу proxies свежими прокси из подписок (только живые)."""
     source_urls = list(config.subscription_urls)
     LOGGER.info("Loaded %s source URLs from config", len(source_urls))
 
-    added = await collect_candidates(source_urls,
-                                     config.fetch_proxy,
-                                     db, toolchain)
+    added = await collect_candidates(source_urls, config.fetch_proxy, db, toolchain)
 
     LOGGER.info("Added fresh alive candidates from subscriptions: %s", added)
     return added
 
 
 async def collect_candidates(
-    source_urls: list[HttpUrl], fetch_proxy: HttpUrl | None,
-    db: Database, toolchain: XrayToolchain
+    source_urls: list[HttpUrl],
+    fetch_proxy: HttpUrl | None,
+    db: Database,
+    toolchain: BinaryToolchain,
 ) -> int:
     """Собирает прокси из всех подписок → temp-таблица → merge в proxies.
     Возвращает только количество добавленных/обновлённых живых прокси.
@@ -56,8 +56,10 @@ async def collect_candidates(
     db.prepare_fresh_candidates_table()
 
     batches = await tqdm.asyncio.tqdm.gather(
-        *(_process_source(url, fetch_proxy, db, toolchain, semaphore)
-          for url in source_urls),
+        *(
+            _process_source(url, fetch_proxy, db, toolchain, semaphore)
+            for url in source_urls
+        ),
         desc="Fetch subscriptions",
         unit="source",
         mininterval=1
@@ -99,9 +101,11 @@ async def collect_candidates(
 
 
 async def _process_source(
-    url: HttpUrl, proxy: HttpUrl | None,
-    db: Database, toolchain: XrayToolchain,
-    semaphore: asyncio.Semaphore
+    url: HttpUrl,
+    proxy: HttpUrl | None,
+    db: Database,
+    toolchain: BinaryToolchain,
+    semaphore: asyncio.Semaphore,
 ) -> tuple[list[CandidateProxy], int]:
     async with semaphore:
         LOGGER.debug("Fetching subscription: %s", url)
@@ -110,8 +114,9 @@ async def _process_source(
             proxy_str = None
             if proxy:
                 proxy_str = proxy.encoded_string()
-            links, subscription = await fetch_subscription_links(url.encoded_string(),
-                                                                 proxy_str, timeout=10)
+            links, subscription = await fetch_subscription_links(
+                url.encoded_string(), proxy_str, timeout=10
+            )
         except Exception:
             LOGGER.exception("Failed to fetch subscription: %s", url)
             return [], 0
@@ -148,8 +153,7 @@ async def _process_source(
         try:
             parsed_configs = await toolchain.convert_links(clean_links)
         except Exception:
-            LOGGER.exception(
-                "Failed to parse links with ProxyConverter: %s", url)
+            LOGGER.exception("Failed to parse links with ProxyConverter: %s", url)
             return [], total_links
 
         candidates: list[CandidateProxy] = []

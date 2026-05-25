@@ -58,9 +58,9 @@ class StopController:
         self.lock = asyncio.Lock()
         self.stop_event = asyncio.Event()
 
-    async def add_success(self):
+    async def add_success(self, count: int = 1):
         async with self.lock:
-            self.success += 1
+            self.success += count
             if self.success >= self.target:
                 self.stop_event.set()
 

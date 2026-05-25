@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import ipaddress
 import logging
 import socket
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from time import monotonic
+from time import monotonic, perf_counter
+from typing import List, Optional, Set, Tuple
 
-import aiodns
+import dns.asyncresolver
+import dns.exception
 
 from app.config import CIDRConfig
 
@@ -20,25 +21,25 @@ LOGGER = logging.getLogger(__name__)
 @dataclass(slots=True)
 class _DNSCacheItem:
     expires_at: float
-    addresses: tuple[str, ...]
+    addresses: Tuple[str, ...]
 
 
 class CIDRReader:
     def __init__(self, config: CIDRConfig) -> None:
         self.config = config
 
-        self._path: Path | None = None
-        self._networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] | None = (
-            None
-        )
+        self._path: Optional[Path] = None
+        self._networks: Optional[
+            List[ipaddress.IPv4Network | ipaddress.IPv6Network]
+        ] = None
 
         self._resolver_lock = asyncio.Lock()
-        self._networks_lock = asyncio.Lock()
         self._dns_lock = asyncio.Lock()
 
-        self._resolvers: list[aiodns.DNSResolver] | None = None
+        self._resolver: Optional[dns.asyncresolver.Resolver] = None
         self._dns_cache: dict[str, _DNSCacheItem] = {}
-        self._dns_inflight: dict[str, asyncio.Task[tuple[str, ...]]] = {}
+        self._dns_inflight: dict[str, asyncio.Task[Tuple[str, ...]]] = {}
+        self._dns_semaphore = asyncio.Semaphore(50)
 
     def ensure_cidr_reader(self) -> None:
         path = Path(self.config.path)
@@ -57,8 +58,8 @@ class CIDRReader:
 
     def _parse_networks(
         self, path: Path
-    ) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
-        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    ) -> List[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+        networks: List[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 
         with path.open("r", encoding="utf-8") as f:
             for line_no, raw_line in enumerate(f, start=1):
@@ -78,6 +79,7 @@ class CIDRReader:
         return networks
 
     async def filter(self, host: str) -> bool:
+        start = perf_counter()
         try:
             if self._networks is None or self._path is None:
                 self.ensure_cidr_reader()
@@ -86,6 +88,8 @@ class CIDRReader:
                 return False
 
             addresses = await self._resolve_host_addresses(host)
+            elapsed_resolve = perf_counter() - start
+
             if not addresses:
                 return False
 
@@ -94,6 +98,14 @@ class CIDRReader:
                 for addr in addresses
                 for network in self._networks
             )
+            elapsed = perf_counter() - start
+            if elapsed > 1:
+                LOGGER.debug(
+                    "filter %s took %.3fs (resolve stage: %.3fs)",
+                    host,
+                    elapsed,
+                    elapsed_resolve,
+                )
 
             return not matched if self.config.method == "exclude" else matched
 
@@ -102,8 +114,8 @@ class CIDRReader:
             return False
 
     async def close(self) -> None:
-        resolvers = self._resolvers
-        self._resolvers = None
+        if self._resolver is not None:
+            self._resolver = None
 
         self._dns_cache.clear()
 
@@ -111,47 +123,26 @@ class CIDRReader:
             task.cancel()
         self._dns_inflight.clear()
 
-        if not resolvers:
-            return
-
-        for resolver in resolvers:
-            await resolver.close()
-
-    async def _ensure_resolvers(self) -> list[aiodns.DNSResolver]:
-        if self._resolvers is not None:
-            return self._resolvers
+    async def _ensure_resolver(self) -> dns.asyncresolver.Resolver:
+        if self._resolver is not None:
+            return self._resolver
 
         async with self._resolver_lock:
-            if self._resolvers is not None:
-                return self._resolvers
+            if self._resolver is not None:
+                return self._resolver
 
-            loop = asyncio.get_running_loop()
-            pool = self.config.dns_nameservers_pool or [[]]
+            resolver = dns.asyncresolver.Resolver()
 
-            resolvers: list[aiodns.DNSResolver] = []
-            for nameservers in pool:
-                if nameservers:
-                    resolvers.append(
-                        aiodns.DNSResolver(loop=loop, nameservers=nameservers)
-                    )
-                else:
-                    resolvers.append(aiodns.DNSResolver(loop=loop))
+            all_nameservers = []
+            for ns_list in self.config.dns_nameservers_pool or [[]]:
+                all_nameservers.extend(ns_list)
+            if all_nameservers:
+                resolver.nameservers = all_nameservers
 
-            self._resolvers = resolvers
-            return resolvers
+            self._resolver = resolver
+            return resolver
 
-    async def _get_resolver(self, host_key: str) -> aiodns.DNSResolver:
-        resolvers = await self._ensure_resolvers()
-        if len(resolvers) == 1:
-            return resolvers[0]
-
-        idx = int.from_bytes(
-            hashlib.blake2s(host_key.encode("utf-8"), digest_size=2).digest(),
-            "big",
-        ) % len(resolvers)
-        return resolvers[idx]
-
-    async def _resolve_host_addresses(self, host: str) -> tuple[str, ...]:
+    async def _resolve_host_addresses(self, host: str) -> Tuple[str, ...]:
         host_key = host.strip().rstrip(".").lower()
 
         try:
@@ -181,42 +172,33 @@ class CIDRReader:
                 if self._dns_inflight.get(host_key) is task and task.done():
                     self._dns_inflight.pop(host_key, None)
 
-    async def _resolve_host_addresses_uncached(self, host_key: str) -> tuple[str, ...]:
-        resolver = await self._get_resolver(host_key)
+    async def _resolve_host_addresses_uncached(self, host_key: str) -> Tuple[str, ...]:
+        async with self._dns_semaphore:
+            resolver = await self._ensure_resolver()
+            try:
+                result = await resolver.resolve_name(host_key, family=socket.AF_UNSPEC)
+            except (dns.exception.DNSException, Exception) as exc:
+                LOGGER.debug("DNS lookup failed for %s: %s", host_key, exc)
+                return ()
 
-        try:
-            result = await resolver.getaddrinfo(
-                host_key,
-                family=socket.AF_UNSPEC,
-                port=None,
-                proto=0,
-                type=0,
-                flags=0,
-            )
-        except aiodns.error.DNSError as exc:
-            LOGGER.debug("DNS lookup failed for %s: %s", host_key, exc)
-            return ()
+            addresses: List[str] = []
+            seen: Set[str] = set()
 
-        addresses: list[str] = []
-        seen: set[str] = set()
+            for addr in result.addresses():
+                if addr not in seen:
+                    seen.add(addr)
+                    addresses.append(addr)
 
-        for node in result.nodes:
-            addr = node.addr[0]
-            addr_str = addr.decode() if isinstance(addr, bytes) else str(addr)
-            if addr_str not in seen:
-                seen.add(addr_str)
-                addresses.append(addr_str)
+            if not addresses:
+                return ()
 
-        if not addresses:
-            return ()
+            resolved = tuple(addresses)
+            expires_at = monotonic() + max(0, int(self.config.dns_cache_ttl))
 
-        resolved = tuple(addresses)
-        expires_at = monotonic() + max(0, int(self.config.dns_cache_ttl))
+            async with self._dns_lock:
+                self._dns_cache[host_key] = _DNSCacheItem(
+                    expires_at=expires_at,
+                    addresses=resolved,
+                )
 
-        async with self._dns_lock:
-            self._dns_cache[host_key] = _DNSCacheItem(
-                expires_at=expires_at,
-                addresses=resolved,
-            )
-
-        return resolved
+            return resolved
