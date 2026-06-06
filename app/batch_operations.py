@@ -5,7 +5,7 @@ from typing import Any, Deque, Iterable
 
 from app.binary_toolchain import BinaryToolchain
 from app.db import Database
-from app.models import CandidateProxy, ProxyTestResult
+from app.models import CandidateProxy, ProxyTestResult, TestResultKind
 
 
 class BatchTestResultWriter:
@@ -42,15 +42,20 @@ class BatchTestResultWriter:
 
 class BatchCandidateReader:
     def __init__(
-        self, db: Database, toolchain: BinaryToolchain, prepare_batch_size: int
+        self,
+        db: Database,
+        toolchain: BinaryToolchain,
+        prepare_batch_size: int,
+        kind: TestResultKind,
     ) -> None:
         self._db = db
         self._toolchain = toolchain
         self._prepare_batch_size = prepare_batch_size
-
+        self._kind = kind
         self._buffer: Deque[tuple[CandidateProxy, dict[str, Any] | None]] = deque()
         self._lock = asyncio.Lock()
         self._last_proxy_hash: str | None = None
+        self._last_latency_ms: float | None = None
         self._finished = False
         self.position = 0
 
@@ -61,16 +66,27 @@ class BatchCandidateReader:
         if self._finished:
             return
 
-        proxies = self._db.fetch_candidate_proxies_batch(
-            self._prepare_batch_size,
-            after_proxy_hash=self._last_proxy_hash,
-        )
+        if self._kind == TestResultKind.SPEED:
+            proxies, last_row = self._db.fetch_candidate_proxies_batch(
+                self._prepare_batch_size,
+                after_proxy_hash=self._last_proxy_hash,
+                after_latency_ms=self._last_latency_ms,
+                order_by="latency",
+            )
+        else:
+            proxies, last_row = self._db.fetch_candidate_proxies_batch(
+                self._prepare_batch_size,
+                after_proxy_hash=self._last_proxy_hash,
+            )
 
-        if not proxies:
+        if not proxies or not last_row:
             self._finished = True
             return
 
-        self._last_proxy_hash = proxies[-1].proxy_hash
+        assert last_row["proxy_hash"] != self._last_proxy_hash, "Same batch"
+
+        self._last_proxy_hash = last_row["proxy_hash"]
+        self._last_latency_ms = last_row["latency_ms"]
 
         links = [p.raw_link for p in proxies]
         converted = await self._toolchain.convert_links(links)

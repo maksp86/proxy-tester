@@ -4,6 +4,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Literal
 
 from .config import GeoIPConfig
 from .models import CandidateProxy, ProxyTestResult, Subscripton
@@ -66,6 +67,9 @@ class Database:
 
                     CREATE INDEX IF NOT EXISTS idx_dead_proxy_expires
                     ON dead_proxies(expires_at);
+          
+                    CREATE INDEX IF NOT EXISTS idx_proxies_latency_hash
+                    ON proxies(latency_ms, proxy_hash) WHERE latency_ms IS NOT NULL;
 
                     CREATE TABLE IF NOT EXISTS selected_proxies (
                         proxy_hash TEXT PRIMARY KEY,
@@ -128,7 +132,9 @@ class Database:
 
     def get_selected(self) -> list[sqlite3.Row]:
         with self.connect() as conn:
-            return conn.execute("SELECT * FROM selected_proxies").fetchall()
+            return conn.execute(
+                "SELECT * FROM selected_proxies ORDER BY mbps DESC, latency_ms ASC"
+            ).fetchall()
 
     def store_selected(self, target_final_count: int) -> None:
         if target_final_count <= 0:
@@ -191,7 +197,6 @@ class Database:
                 )
 
     def prepare_fresh_candidates_table(self) -> None:
-        """Создаёт (или пересоздаёт) временную таблицу для свежих кандидатов."""
         with self._write_lock:
             with self.connect() as conn:
                 conn.execute("DROP TABLE IF EXISTS temp_fresh_candidates;")
@@ -204,7 +209,6 @@ class Database:
                     """)
 
     def insert_fresh_candidates_batch(self, data: list[CandidateProxy]) -> None:
-        """Вставляет батч во временную таблицу (автоматический dedup через PRIMARY KEY)."""
         if not data:
             return
         with self._write_lock:
@@ -215,12 +219,6 @@ class Database:
                 )
 
     def merge_fresh_candidates_to_proxies(self) -> int:
-        """Сливает temp_fresh_candidates → proxies:
-        - пропускает dead_proxies
-        - для новых: first_seen_at = strftime('%s','now')
-        - для существующих: обновляет last_seen_at + raw_link/scheme
-        Возвращает количество обработанных живых прокси (новые + обновлённые).
-        """
         with self._write_lock:
             with self.connect() as conn:
                 conn.execute("""
@@ -269,7 +267,6 @@ class Database:
                 return num_fresh
 
     def cleanup_fresh_candidates_table(self) -> None:
-        """Удаляет временную таблицу."""
         with self._write_lock:
             with self.connect() as conn:
                 conn.execute("DROP TABLE IF EXISTS temp_fresh_candidates;")
@@ -278,32 +275,71 @@ class Database:
         self,
         limit: int,
         after_proxy_hash: str | None = None,
-    ) -> list[CandidateProxy]:
+        after_latency_ms: float | None = None,
+        order_by: Literal["proxy_hash", "latency"] = "proxy_hash",
+    ) -> tuple[list[CandidateProxy], sqlite3.Row | None]:
         with self._write_lock:
             with self.connect() as conn:
-                if after_proxy_hash is None:
-                    cursor = conn.execute(
-                        """
-                        SELECT *
-                        FROM proxies
-                        ORDER BY proxy_hash
-                        LIMIT ?
-                        """,
-                        (limit,),
-                    )
+                if order_by == "latency":
+                    if after_latency_ms is None or after_proxy_hash is None:
+                        cursor = conn.execute(
+                            """
+                            SELECT *
+                            FROM proxies
+                            WHERE latency_ms IS NOT NULL
+                            ORDER BY latency_ms ASC, proxy_hash ASC
+                            LIMIT ?
+                            """,
+                            (limit,),
+                        )
+                    else:
+                        cursor = conn.execute(
+                            """
+                            SELECT *
+                            FROM proxies
+                            WHERE latency_ms IS NOT NULL
+                            AND (
+                                latency_ms > ?
+                                OR (latency_ms = ? AND proxy_hash > ?)
+                            )
+                            ORDER BY latency_ms ASC, proxy_hash ASC
+                            LIMIT ?
+                            """,
+                            (
+                                after_latency_ms,
+                                after_latency_ms,
+                                after_proxy_hash,
+                                limit,
+                            ),
+                        )
                 else:
-                    cursor = conn.execute(
-                        """
-                        SELECT *
-                        FROM proxies
-                        WHERE proxy_hash > ?
-                        ORDER BY proxy_hash
-                        LIMIT ?
-                        """,
-                        (after_proxy_hash, limit),
-                    )
+                    if after_proxy_hash is None:
+                        cursor = conn.execute(
+                            """
+                            SELECT *
+                            FROM proxies
+                            ORDER BY proxy_hash ASC
+                            LIMIT ?
+                            """,
+                            (limit,),
+                        )
+                    else:
+                        cursor = conn.execute(
+                            """
+                            SELECT *
+                            FROM proxies
+                            WHERE proxy_hash > ?
+                            ORDER BY proxy_hash ASC
+                            LIMIT ?
+                            """,
+                            (after_proxy_hash, limit),
+                        )
 
-                return [CandidateProxy.from_row(row) for row in cursor.fetchall()]
+                proxies = cursor.fetchall()
+                return (
+                    [CandidateProxy.from_row(row) for row in proxies],
+                    proxies[-1] if len(proxies) > 0 else None,
+                )
 
     def count_candidate_proxies(self) -> int:
         with self._write_lock:
@@ -376,3 +412,41 @@ class Database:
 
                 cur.execute(sql, params)
                 conn.commit()
+
+    def mark_dead_duplicate_ip_proxies(self) -> int:
+        with self._write_lock:
+            with self.connect() as conn:
+                cursor = conn.execute("""
+                    WITH ranked AS (
+                        SELECT
+                            proxy_hash,
+                            RANK() OVER (
+                                PARTITION BY exit_ip
+                                ORDER BY
+                                    CASE WHEN latency_ms IS NULL THEN 1 ELSE 0 END,
+                                    latency_ms ASC
+                            ) AS rnk
+                        FROM proxies
+                        WHERE exit_ip IS NOT NULL
+                    )
+                    UPDATE proxies
+                    SET
+                        last_status = 'dead',
+                        reason = 'duplicate'
+                    WHERE proxy_hash IN (
+                        SELECT proxy_hash
+                        FROM ranked
+                        WHERE rnk > 1
+                    )
+                    RETURNING proxy_hash
+                    """)
+                return cursor.rowcount
+
+    def cleanup_duplicate_dead_proxies(self) -> int:
+        with self._write_lock:
+            with self.connect() as conn:
+                cursor = conn.execute("""
+                    DELETE FROM dead_proxies
+                    WHERE reason = 'duplicate'
+                    """)
+                return cursor.rowcount

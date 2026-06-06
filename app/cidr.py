@@ -7,31 +7,30 @@ import socket
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from time import monotonic, perf_counter
+from time import perf_counter
 from typing import List, Optional, Set, Tuple
 
 import dns.asyncresolver
 import dns.exception
+import dns.resolver  # Добавили импорт для перехвата NXDOMAIN
 
 from app.config import CIDRConfig
+from app.helpers import FastNetworkSearch
 
 LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
 class _DNSCacheItem:
-    expires_at: float
-    addresses: Tuple[str, ...]
+    matched_addresses: Tuple[str, ...]
+    result: bool
 
 
 class CIDRReader:
     def __init__(self, config: CIDRConfig) -> None:
         self.config = config
 
-        self._path: Optional[Path] = None
-        self._networks: Optional[
-            List[ipaddress.IPv4Network | ipaddress.IPv6Network]
-        ] = None
+        self._network_search = FastNetworkSearch()
 
         self._resolver_lock = asyncio.Lock()
         self._dns_lock = asyncio.Lock()
@@ -53,61 +52,53 @@ class CIDRReader:
             urllib.request.urlretrieve(str(self.config.url), str(path))
             LOGGER.info("CIDR file downloaded to %s", path)
 
-        self._path = path
-        self._networks = self._parse_networks(path)
-
-    def _parse_networks(
-        self, path: Path
-    ) -> List[ipaddress.IPv4Network | ipaddress.IPv6Network]:
-        networks: List[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-
-        with path.open("r", encoding="utf-8") as f:
-            for line_no, raw_line in enumerate(f, start=1):
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                try:
-                    networks.append(ipaddress.ip_network(line, strict=False))
-                except ValueError as exc:
-                    LOGGER.warning(
-                        "Skipping invalid CIDR on line %d in %s: %s",
-                        line_no,
-                        path,
-                        exc,
-                    )
-
-        return networks
+        self._network_search.ensure_networks(path)
 
     async def filter(self, host: str) -> bool:
         start = perf_counter()
         try:
-            if self._networks is None or self._path is None:
-                self.ensure_cidr_reader()
+            host_key = host.strip().rstrip(".").lower()
 
-            if not self._networks:
-                return False
+            async with self._dns_lock:
+                if host_key in self._dns_cache:
+                    return self._dns_cache[host_key].result
 
-            addresses = await self._resolve_host_addresses(host)
-            elapsed_resolve = perf_counter() - start
+            try:
+                addresses = await self._resolve_host_addresses(host_key)
+                elapsed_resolve = perf_counter() - start
 
-            if not addresses:
-                return False
+                matched_addresses = tuple(
+                    addr
+                    for addr in addresses
+                    if self._network_search.find_network(addr)
+                )
+                matched = len(matched_addresses) > 0
+                result = not matched if self.config.method == "exclude" else matched
 
-            matched = any(
-                ipaddress.ip_address(addr) in network
-                for addr in addresses
-                for network in self._networks
-            )
+            except dns.resolver.NXDOMAIN:
+                elapsed_resolve = perf_counter() - start
+                LOGGER.debug(
+                    "Host %s returned NXDOMAIN. Caching result as False.", host_key
+                )
+                matched_addresses = ()
+                result = False
+
             elapsed = perf_counter() - start
             if elapsed > 1:
                 LOGGER.debug(
-                    "filter %s took %.3fs (resolve stage: %.3fs)",
+                    "filter %s (key %s) took %.3fs (resolve stage: %.3fs)",
                     host,
+                    host_key,
                     elapsed,
                     elapsed_resolve,
                 )
 
-            return not matched if self.config.method == "exclude" else matched
+            async with self._dns_lock:
+                self._dns_cache[host_key] = _DNSCacheItem(
+                    matched_addresses=matched_addresses, result=result
+                )
+
+            return result
 
         except Exception as exc:
             LOGGER.warning("Failed to check host %s: %s", host, exc)
@@ -142,22 +133,14 @@ class CIDRReader:
             self._resolver = resolver
             return resolver
 
-    async def _resolve_host_addresses(self, host: str) -> Tuple[str, ...]:
-        host_key = host.strip().rstrip(".").lower()
-
+    async def _resolve_host_addresses(self, host_key: str) -> Tuple[str, ...]:
         try:
             ip = ipaddress.ip_address(host_key)
             return (str(ip),)
         except ValueError:
             pass
 
-        now = monotonic()
-
         async with self._dns_lock:
-            cached = self._dns_cache.get(host_key)
-            if cached is not None and cached.expires_at > now:
-                return cached.addresses
-
             task = self._dns_inflight.get(host_key)
             if task is None:
                 task = asyncio.create_task(
@@ -177,6 +160,8 @@ class CIDRReader:
             resolver = await self._ensure_resolver()
             try:
                 result = await resolver.resolve_name(host_key, family=socket.AF_UNSPEC)
+            except dns.resolver.NXDOMAIN:
+                raise
             except (dns.exception.DNSException, Exception) as exc:
                 LOGGER.debug("DNS lookup failed for %s: %s", host_key, exc)
                 return ()
@@ -189,16 +174,4 @@ class CIDRReader:
                     seen.add(addr)
                     addresses.append(addr)
 
-            if not addresses:
-                return ()
-
-            resolved = tuple(addresses)
-            expires_at = monotonic() + max(0, int(self.config.dns_cache_ttl))
-
-            async with self._dns_lock:
-                self._dns_cache[host_key] = _DNSCacheItem(
-                    expires_at=expires_at,
-                    addresses=resolved,
-                )
-
-            return resolved
+            return tuple(addresses)

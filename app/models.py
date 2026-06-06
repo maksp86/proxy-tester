@@ -33,13 +33,16 @@ class TestResultReasons(Enum):
     OK = "ok"
     UNKNOWN = "unknown"
     INVALID_URI = "invalid_proxy_uri"
+    INVALID_OUTBOUND = "invalid_outbound"
     URL_FAIL = "url_test_failed"
+    LATENCY_EXCEEDED = "latency_exceeded"
     SPEED_FAIL = "speed_test_failed"
     SPEED_BELOW_THRESHOLD = "speed_below_threshold"
     CIDR_DISCARDED = "cidr_discarded"
+    CONNECT_FAILED = "connect_failed"
 
     @classmethod
-    def from_str(cls, value: str | None) -> "TestResultReasons":
+    def from_str(cls, value: str | None) -> TestResultReasons:
         if value is None:
             return cls.UNKNOWN
         try:
@@ -52,6 +55,7 @@ class TestResultKind(str, Enum):
     URL = "url"
     SPEED = "speed"
     CIDR = "cidr"
+    CONNECT = "connect"
 
 
 @dataclass(slots=True)
@@ -70,11 +74,18 @@ class ProxyTestResult:
     def from_dict(
         cls, tag: str, kind: TestResultKind, data: dict[str, Any]
     ) -> ProxyTestResult:
+        reason_str = data.get("reason", "test_failed")
+        if reason_str == "test_failed":
+            reason_str = f"{kind.value}_{reason_str}"
+
+        reason = TestResultReasons.from_str(reason_str)
+        if reason.value == "unknown":
+            pass
         return cls(
             proxy_hash=tag,
             kind=kind,
             success=data.get("result", False),
-            reason=TestResultReasons.from_str(data.get("reason")),
+            reason=reason,
             latency_ms=data.get("latency", None),
             exit_ip=data.get("exit-ip", None),
             country=data.get("country", None),

@@ -6,6 +6,8 @@ import logging
 import urllib.request
 from pathlib import Path
 
+import colorlog
+
 from app.binary_toolchain import BinaryToolchain
 from app.config import AppConfig
 from app.db import Database
@@ -20,8 +22,24 @@ def setup_logging(verbose: bool) -> None:
     """
 
     level = logging.DEBUG if verbose else logging.INFO
+
+    handler = colorlog.StreamHandler()
+    handler.setFormatter(
+        colorlog.ColoredFormatter(
+            "%(log_color)s%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            log_colors={
+                "DEBUG": "white",
+                "INFO": "green",
+                "WARNING": "yellow",
+                "ERROR": "red",
+                "CRITICAL": "red,bg_white",
+            },
+        )
+    )
+
     logging.basicConfig(
         level=level,
+        handlers=[handler],
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
     logging.debug("Logging initialized. verbose=%s", verbose)

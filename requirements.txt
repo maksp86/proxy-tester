@@ -4,3 +4,4 @@ geoip2
 tqdm
 emoji-country-flag
 pydantic
+colorlog

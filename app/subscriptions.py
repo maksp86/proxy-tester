@@ -8,6 +8,7 @@ from pydantic import HttpUrl
 from .binary_toolchain import BinaryToolchain, fetch_subscription_links
 from .config import AppConfig
 from .db import Database
+from .helpers import extract_address, find_key_nonrecursive, is_port_excluded
 from .models import CandidateProxy
 
 LOGGER = logging.getLogger(__name__)
@@ -29,6 +30,41 @@ def hash_link(link: str) -> str:
     return hashlib.sha256(link.encode("utf-8")).hexdigest()
 
 
+def hash_outbound(outbound: dict) -> tuple[str, str, int]:
+    info = ""
+
+    address, port = extract_address(outbound)
+
+    if not address or not port:
+        raise ValueError("No address or port")
+
+    info += address
+
+    port = find_key_nonrecursive(outbound, "port")
+    info += str(port)
+
+    id_str = ""
+    match outbound["protocol"]:
+        case "hysteria":
+            password = find_key_nonrecursive(outbound, "auth") or ""
+            id_str += password
+        case "vless" | "vmess":
+            email = find_key_nonrecursive(outbound, "id") or ""
+            id_str += email
+        case "shadowsocks" | "trojan":
+            email = find_key_nonrecursive(outbound, "email") or ""
+            password = find_key_nonrecursive(outbound, "password") or ""
+            id_str += email + password
+        case _:
+            user = find_key_nonrecursive(outbound, "user") or ""
+            email = find_key_nonrecursive(outbound, "email") or ""
+            password = find_key_nonrecursive(outbound, "pass") or ""
+            id_str += user + email + password
+
+    hash_str = hashlib.sha256(info.encode("utf-8")).hexdigest()
+    return hash_str, str(address), int(str(port))
+
+
 async def fetch_candidates(
     config: AppConfig, db: Database, toolchain: BinaryToolchain
 ) -> int:
@@ -36,7 +72,7 @@ async def fetch_candidates(
     source_urls = list(config.subscription_urls)
     LOGGER.info("Loaded %s source URLs from config", len(source_urls))
 
-    added = await collect_candidates(source_urls, config.fetch_proxy, db, toolchain)
+    added = await collect_candidates(source_urls, config, db, toolchain)
 
     LOGGER.info("Added fresh alive candidates from subscriptions: %s", added)
     return added
@@ -44,7 +80,7 @@ async def fetch_candidates(
 
 async def collect_candidates(
     source_urls: list[HttpUrl],
-    fetch_proxy: HttpUrl | None,
+    config: AppConfig,
     db: Database,
     toolchain: BinaryToolchain,
 ) -> int:
@@ -57,12 +93,12 @@ async def collect_candidates(
 
     batches = await tqdm.asyncio.tqdm.gather(
         *(
-            _process_source(url, fetch_proxy, db, toolchain, semaphore)
+            _process_source(url, config, db, toolchain, semaphore)
             for url in source_urls
         ),
         desc="Fetch subscriptions",
         unit="source",
-        mininterval=1
+        mininterval=1,
     )
 
     total_links = 0
@@ -102,7 +138,7 @@ async def collect_candidates(
 
 async def _process_source(
     url: HttpUrl,
-    proxy: HttpUrl | None,
+    config: AppConfig,
     db: Database,
     toolchain: BinaryToolchain,
     semaphore: asyncio.Semaphore,
@@ -112,10 +148,10 @@ async def _process_source(
 
         try:
             proxy_str = None
-            if proxy:
-                proxy_str = proxy.encoded_string()
+            if config.fetch_proxy:
+                proxy_str = config.fetch_proxy.encoded_string()
             links, subscription = await fetch_subscription_links(
-                url.encoded_string(), proxy_str, timeout=10
+                url.encoded_string(), proxy_str, timeout=60
             )
         except Exception:
             LOGGER.exception("Failed to fetch subscription: %s", url)
@@ -162,8 +198,19 @@ async def _process_source(
             if parsed_outbound is None:
                 continue
 
+            address, port = extract_address(parsed_outbound)
+            if not address or not port:
+                continue
+
             digest = hash_link(link)
             scheme = parsed_outbound["protocol"]
+
+            port_excluded = is_port_excluded(config.filter.proxy.excluded_ports, port)
+            scheme_excluded = scheme in config.filter.proxy.excluded_protocols
+
+            if scheme_excluded or port_excluded:
+                continue
+
             candidates.append(
                 CandidateProxy(
                     proxy_hash=digest,
@@ -171,5 +218,6 @@ async def _process_source(
                     scheme=scheme,
                 )
             )
+        parsed_configs.clear()
 
         return candidates, total_links

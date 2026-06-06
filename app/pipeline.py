@@ -12,9 +12,10 @@ from .batch_operations import BatchCandidateReader, BatchTestResultWriter
 from .binary_toolchain import BinaryToolchain
 from .cidr import CIDRReader
 from .config import AppConfig, CIDRConfig
+from .connect_tester import ConnectTester
 from .db import Database
 from .exporter import write_export
-from .helpers import StopController, find_key_nonrecursive
+from .helpers import StopController, extract_address
 from .models import CandidateProxy, ProxyTestResult, TestResultKind, TestResultReasons
 from .proxy_tester import ProxyTester
 from .subscriptions import fetch_candidates
@@ -38,7 +39,7 @@ async def _cidr_filter_one(
             )
         )
 
-    host = find_key_nonrecursive(outbound, "address")
+    host, _ = extract_address(outbound)
     if not host:
         raise Exception("No host address found in config")
 
@@ -66,33 +67,101 @@ async def _cidr_filter_stage(
     cidr_reader = CIDRReader(config)
     cidr_reader.ensure_cidr_reader()
 
-    candidate_reader = BatchCandidateReader(db, toolchain, 100)
+    candidate_reader = BatchCandidateReader(db, toolchain, 100, TestResultKind.CIDR)
     result_writer = BatchTestResultWriter(db, 1000)
 
     tasks = set()
 
-    pbar = tqdm(total=candidates_count, mininterval=2, desc="CIDR test", unit="proxies")
+    pbar = tqdm(
+        total=candidates_count,
+        mininterval=2,
+        desc="CIDR test",
+        unit="proxies",
+        colour="MAGENTA",
+    )
 
     while not candidate_reader.is_finished():
-        proxy, outbound = (await candidate_reader.take(1))[0]
+        res = await candidate_reader.take(1)
+        if not res:
+            break
+
+        proxy, outbound = res[0]
         task = asyncio.create_task(
             _cidr_filter_one(proxy, outbound, cidr_reader, result_writer)
         )
         tasks.add(task)
 
         if len(tasks) >= 50:
-            _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            pbar.n = candidate_reader.position
-            pbar.refresh()
+            completed, tasks = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            pbar.update(len(completed))
 
     pbar.close()
 
     if tasks:
         await tqdm_asyncio.gather(
-            *tasks, desc="Ending CIDR-test", unit="tasks", mininterval=2
+            *tasks,
+            desc="Ending CIDR-test",
+            unit="tasks",
+            mininterval=2,
+            colour="MAGENTA",
         )
 
     await cidr_reader.close()
+    result_writer.flush()
+
+
+async def _connect_test_stage(
+    config: AppConfig, db: Database, toolchain: BinaryToolchain, candidates_count: int
+) -> None:
+    LOGGER.debug("Connect test starting")
+
+    max_tasks = 50
+
+    candidate_reader = BatchCandidateReader(
+        db, toolchain, max_tasks * 4, kind=TestResultKind.CONNECT
+    )
+
+    result_writer = BatchTestResultWriter(db, 1000)
+
+    proxy_tester = ConnectTester(config.tester, result_writer)
+    tasks: set[asyncio.Task] = set()
+
+    pbar = tqdm(
+        total=candidates_count,
+        mininterval=2,
+        desc="Connect test",
+        unit="proxies",
+        colour="GREEN",
+    )
+
+    while not candidate_reader.is_finished():
+        res = await candidate_reader.take(1)
+        if not res:
+            break
+
+        task = asyncio.create_task(proxy_tester.test_proxy(res[0]))
+        tasks.add(task)
+
+        if len(tasks) >= max_tasks:
+            completed, tasks = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            pbar.update(len(completed))
+
+    pbar.n = candidate_reader.position
+    pbar.close()
+
+    if tasks:
+        await tqdm_asyncio.gather(
+            *tasks,
+            desc="Ending Connect-test",
+            unit="tasks",
+            mininterval=2,
+            colour="GREEN",
+        )
+
     result_writer.flush()
 
 
@@ -105,7 +174,9 @@ async def _url_test_stage(
         config.tester.url_test.worker_count * config.tester.url_test.worker_tasks_count
     )
 
-    candidate_reader = BatchCandidateReader(db, toolchain, max_tasks * 4)
+    candidate_reader = BatchCandidateReader(
+        db, toolchain, max_tasks * 4, kind=TestResultKind.URL
+    )
 
     result_writer = BatchTestResultWriter(db, 1000)
 
@@ -114,7 +185,13 @@ async def _url_test_stage(
     )
     tasks: set[asyncio.Task] = set()
 
-    pbar = tqdm(total=candidates_count, mininterval=2, desc="URL test", unit="proxies")
+    pbar = tqdm(
+        total=candidates_count,
+        mininterval=2,
+        desc="URL test",
+        unit="proxies",
+        colour="BLUE",
+    )
 
     while not candidate_reader.is_finished():
         task = asyncio.create_task(
@@ -133,7 +210,7 @@ async def _url_test_stage(
 
     if tasks:
         await tqdm_asyncio.gather(
-            *tasks, desc="Ending URL-test", unit="tasks", mininterval=2
+            *tasks, desc="Ending URL-test", unit="tasks", mininterval=2, colour="BLUE"
         )
 
     result_writer.flush()
@@ -152,17 +229,23 @@ async def _speed_test_stage(
         config.tester.url_test.worker_count * config.tester.url_test.worker_tasks_count
     )
 
-    candidate_reader = BatchCandidateReader(db, toolchain, max_tasks * 4)
+    candidate_reader = BatchCandidateReader(
+        db, toolchain, max_tasks * 4, TestResultKind.SPEED
+    )
 
     result_writer = BatchTestResultWriter(db, 100)
 
     proxy_tester = ProxyTester(
-        result_writer, config.tester, TestResultKind.URL, toolchain, config.filter.geoip
+        result_writer, config.tester, TestResultKind.SPEED, toolchain
     )
     tasks: set[asyncio.Task] = set()
 
     pbar = tqdm(
-        total=candidates_count, mininterval=2, desc="Speed test", unit="proxies"
+        total=candidates_count,
+        mininterval=2,
+        desc="Speed test",
+        unit="proxies",
+        colour="CYAN",
     )
 
     exhausted = False
@@ -203,7 +286,11 @@ async def _speed_test_stage(
             await asyncio.gather(*tasks, return_exceptions=True)
         else:
             await tqdm_asyncio.gather(
-                *tasks, desc="Finishing speed test", unit="tasks", mininterval=2
+                *tasks,
+                desc="Finishing speed test",
+                unit="tasks",
+                mininterval=2,
+                colour="CYAN",
             )
 
     result_writer.flush()
@@ -215,7 +302,16 @@ async def run_once(config: AppConfig, db: Database, toolchain: BinaryToolchain) 
     LOGGER.info("Initializing DB schema")
     db.init_schema()
     cleaned = db.cleanup_expired_dead()
-    LOGGER.info("Expired dead proxies cleaned: %s", cleaned)
+
+    if config.filter.deduplicate:
+        duplicate_cleaned = db.cleanup_duplicate_dead_proxies()
+        LOGGER.info(
+            "Expired dead proxies cleaned: %s, cleaned duplicates from dead: %s",
+            cleaned,
+            duplicate_cleaned,
+        )
+    else:
+        LOGGER.info("Expired dead proxies cleaned: %s", cleaned)
 
     fresh_candidates_count = await fetch_candidates(config, db, toolchain)
 
@@ -236,11 +332,21 @@ async def run_once(config: AppConfig, db: Database, toolchain: BinaryToolchain) 
         db.move_dead_proxies(config.tester.dead_ttl_days)
         candidates_count = db.count_candidate_proxies()
 
+    LOGGER.info("Selected for connect stage: %s", candidates_count)
+    await _connect_test_stage(config, db, toolchain, candidates_count)
+
+    db.move_dead_proxies(config.tester.dead_ttl_days)
+    candidates_count = db.count_candidate_proxies()
+
     LOGGER.info("Selected for url stage: %s", candidates_count)
     await _url_test_stage(config, db, toolchain, candidates_count)
 
     if config.filter.geoip:
         db.geoip_filter_proxies(config.filter.geoip)
+
+    if config.filter.deduplicate:
+        duplicates_count = db.mark_dead_duplicate_ip_proxies()
+        LOGGER.info("Marked dead %s duplicates", duplicates_count)
 
     db.move_dead_proxies(config.tester.dead_ttl_days)
 

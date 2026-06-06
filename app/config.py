@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, List, Literal, Tuple
 
 from pydantic import (
     BaseModel,
@@ -138,6 +138,45 @@ class GeoIPConfig(BaseModel):
         return [str(x).strip().upper() for x in v if str(x).strip()]
 
 
+class ProxyFilterConfig(BaseModel):
+    excluded_protocols: List[str] = Field(default_factory=list)
+    excluded_ports: List[Tuple[int, int]] = Field(default_factory=list)
+
+    @field_validator("excluded_ports", mode="before")
+    @classmethod
+    def parse_ports(cls, value):
+        if isinstance(value, list):
+            return value
+
+        if not isinstance(value, str):
+            raise TypeError("excluded_ports must be a string")
+
+        ranges = []
+
+        for part in value.split(","):
+            part = part.strip()
+
+            if "-" in part:
+                start_str, end_str = part.split("-", 1)
+
+                start = int(start_str)
+                end = int(end_str)
+
+                if start < 1 or end > 65535 or start > end:
+                    raise ValueError(f"Invalid port range: {part}")
+
+                ranges.append((start, end))
+            else:
+                port = int(part)
+
+                if port < 1 or port > 65535:
+                    raise ValueError(f"Invalid port: {port}")
+
+                ranges.append((port, port))
+
+        return ranges
+
+
 class CIDRConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -182,8 +221,11 @@ class ExportConfig(BaseModel):
 class FilterConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    deduplicate: bool = True
+
     geoip: GeoIPConfig | None = None
     cidr: CIDRConfig | None = None
+    proxy: ProxyFilterConfig = Field(default_factory=ProxyFilterConfig)
 
     @field_validator("geoip", "cidr", mode="before")
     @classmethod

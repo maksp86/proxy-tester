@@ -10,6 +10,7 @@ from pydantic import HttpUrl
 from app.batch_operations import BatchTestResultWriter
 from app.binary_toolchain import BinaryToolchain
 from app.config import GeoIPConfig, TesterConfig
+from app.helpers import is_safe_xhttp_config
 from app.models import (
     CandidateProxy,
     ProxyTestResult,
@@ -43,6 +44,7 @@ class ProxyTester:
         self._config = config
         self._kind = kind
         self._tester_args: list[str] = []
+        self._one_proxy_timeout: float = 1
 
         worker_count = 1
 
@@ -54,11 +56,11 @@ class ProxyTester:
         self._tester_args.append(
             f"--connect-timeout={int(config.url_test.timeout * 1000)}"
         )
+        self._one_proxy_timeout = config.test_attempts * config.url_test.timeout
 
         if geoip_config and geoip_config.path and geoip_config.path.exists():
             ensure_geoip_database(geoip_config.path, geoip_config.url)
-            self._tester_args.append(
-                f"--geoip2-db-path={geoip_config.path.resolve()}")
+            self._tester_args.append(f"--geoip2-db-path={geoip_config.path.resolve()}")
 
         if kind == TestResultKind.SPEED:
             worker_count = config.speed_test.worker_count
@@ -68,6 +70,9 @@ class ProxyTester:
             )
             self._tester_args.append(
                 f"--download-timeout={int(config.speed_test.timeout * 1000)}"
+            )
+            self._one_proxy_timeout = config.test_attempts * (
+                config.url_test.timeout + config.speed_test.timeout
             )
             self._tester_args.append(
                 f"--min-speed-mbps={config.speed_test.speed_threshold}"
@@ -81,8 +86,7 @@ class ProxyTester:
             self._tester_args.append(
                 f"--max-latency={int(config.url_test.timeout * 1000)}"
             )
-            self._tester_args.append(
-                f"--exit-ip-url={",".join(IP_RESOLVER_URLS[:3])}")
+            self._tester_args.append(f"--exit-ip-url={",".join(IP_RESOLVER_URLS[:3])}")
 
         self._semaphore = asyncio.Semaphore(worker_count)
 
@@ -91,11 +95,13 @@ class ProxyTester:
     ) -> int:
         if self._kind == TestResultKind.CIDR:
             raise ValueError("Invalid test kind")
+        if not data:
+            return 0
 
         async with self._semaphore:
             tester_payload = []
             for candidate, outbound in data:
-                if not outbound:
+                if not outbound or not is_safe_xhttp_config(outbound):
                     self._batch_writer.add(
                         ProxyTestResult(
                             proxy_hash=candidate.proxy_hash,
@@ -108,7 +114,9 @@ class ProxyTester:
                 outbound["tag"] = candidate.proxy_hash
                 tester_payload.append(outbound)
 
-            tester_out = await self.run_tester(tester_payload)
+            tester_out = await self.run_tester(
+                tester_payload, self._one_proxy_timeout * len(tester_payload)
+            )
             tester_payload.clear()
 
             if not tester_out:
@@ -129,7 +137,7 @@ class ProxyTester:
             return success_count
 
     async def run_tester(
-        self, tester_payload: list[dict[str, Any]]
+        self, tester_payload: list[dict[str, Any]], timeout: float
     ) -> dict[str, Any] | None:
         proc = await asyncio.create_subprocess_exec(
             str(self._toolchain.xray_path),
@@ -139,15 +147,18 @@ class ProxyTester:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        task_cancelled = False
 
-        LOGGER.debug("Started tester on batch of %s proxies",
-                     len(tester_payload))
+        LOGGER.debug(
+            "Started tester %s on batch of %s proxies", proc.pid, len(tester_payload)
+        )
 
         try:
-            o, e = await proc.communicate(json.dumps(tester_payload).encode())
+            o, e = await asyncio.wait_for(
+                proc.communicate(json.dumps(tester_payload).encode()), timeout * 2
+            )
 
-            if proc.returncode != 0:
-                print(" ".join(self._tester_args))
+            if proc.returncode != 0 and not task_cancelled:
                 raise RuntimeError(
                     f"Tester exited with code {proc.returncode}. Error was: '{e.decode()}'"
                 )
@@ -161,6 +172,7 @@ class ProxyTester:
 
             return result
         except asyncio.CancelledError:
+            task_cancelled = True
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()
