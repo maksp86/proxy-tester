@@ -13,22 +13,22 @@ from pydantic import (
     model_validator,
 )
 
-_TIMEOUT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s|m)?\s*$", re.IGNORECASE)
+_TIME_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s|m)?\s*$", re.IGNORECASE)
 
 
-def parse_timeout(value: Any) -> float:
-    if isinstance(value, (int, float)):
+def parse_time(value: Any, is_timeout: bool = True) -> float:
+    if is_timeout and isinstance(value, (int, float)):
         if value <= 0:
             raise ValueError("timeout must be > 0")
         return float(value)
 
     if isinstance(value, str):
-        m = _TIMEOUT_RE.match(value)
+        m = _TIME_RE.match(value)
         if not m:
-            raise ValueError("timeout must look like 10, 10s, 500ms or 2m")
+            raise ValueError("time must look like 10, 10s, 500ms or 2m")
 
         num = float(m.group(1))
-        if num <= 0:
+        if num <= 0 and is_timeout:
             raise ValueError("timeout must be > 0")
 
         unit = (m.group(2) or "s").lower()
@@ -38,7 +38,7 @@ def parse_timeout(value: Any) -> float:
             return num * 60.0
         return num
 
-    raise TypeError("timeout must be a number or a string")
+    raise TypeError("time must be a number or a string")
 
 
 def _non_empty_path(v: Any) -> Any:
@@ -67,7 +67,7 @@ class SpeedTestConfig(BaseModel):
     @field_validator("timeout", mode="before")
     @classmethod
     def _parse_timeout(cls, v: Any) -> float:
-        return parse_timeout(v)
+        return parse_time(v)
 
     @field_validator("worker_count", "worker_tasks_count")
     @classmethod
@@ -88,7 +88,7 @@ class UrlTestConfig(BaseModel):
     @field_validator("timeout", mode="before")
     @classmethod
     def _parse_timeout(cls, v: Any) -> float:
-        return parse_timeout(v)
+        return parse_time(v)
 
     @field_validator("worker_count", "worker_tasks_count")
     @classmethod
@@ -98,14 +98,26 @@ class UrlTestConfig(BaseModel):
         return v
 
 
+class ConnectTestConfig(BaseModel):
+    timeout: float = 2.0
+    concurrent_tasks: int = 50
+    attempts: int = 3
+
 class TesterConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     speed_test: SpeedTestConfig = Field(default_factory=SpeedTestConfig)
     url_test: UrlTestConfig = Field(default_factory=UrlTestConfig)
+    connect_test: ConnectTestConfig | None = None
     target_final_count: int = 25
     test_attempts: int = 3
     dead_ttl_days: int = 30
+    cooldown_time: float = 10.0
+
+    @field_validator("cooldown_time", mode="before")
+    @classmethod
+    def _parse_cooldown_time(cls, v: Any) -> float:
+        return parse_time(v, False)
 
     @field_validator("target_final_count", "test_attempts")
     @classmethod
@@ -183,6 +195,8 @@ class CIDRConfig(BaseModel):
     url: HttpUrl | None = None
     path: Path = Path("cidr.txt")
     method: Literal["exclude", "include"] = "exclude"
+
+    concurrent_tasks: int = 50
 
     # Each item is one resolver, and each resolver may contain one or more nameservers.
     # Example:

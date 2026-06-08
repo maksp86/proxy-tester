@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import datetime
 from typing import Any
 
 from tqdm import tqdm
@@ -11,7 +12,7 @@ from tqdm.asyncio import tqdm_asyncio
 from .batch_operations import BatchCandidateReader, BatchTestResultWriter
 from .binary_toolchain import BinaryToolchain
 from .cidr import CIDRReader
-from .config import AppConfig, CIDRConfig
+from .config import AppConfig, CIDRConfig, ConnectTestConfig
 from .connect_tester import ConnectTester
 from .db import Database
 from .exporter import write_export
@@ -21,6 +22,12 @@ from .proxy_tester import ProxyTester
 from .subscriptions import fetch_candidates
 
 LOGGER = logging.getLogger(__name__)
+
+
+async def _cooldown(cooldown_time: float):
+    if cooldown_time > 0:
+        LOGGER.info("Cooldown %s", datetime.timedelta(seconds=cooldown_time))
+        await asyncio.sleep(cooldown_time)
 
 
 async def _cidr_filter_one(
@@ -67,7 +74,8 @@ async def _cidr_filter_stage(
     cidr_reader = CIDRReader(config)
     cidr_reader.ensure_cidr_reader()
 
-    candidate_reader = BatchCandidateReader(db, toolchain, 100, TestResultKind.CIDR)
+    candidate_reader = BatchCandidateReader(
+        db, toolchain, 100, TestResultKind.CIDR)
     result_writer = BatchTestResultWriter(db, 1000)
 
     tasks = set()
@@ -91,7 +99,7 @@ async def _cidr_filter_stage(
         )
         tasks.add(task)
 
-        if len(tasks) >= 50:
+        if len(tasks) >= config.concurrent_tasks:
             completed, tasks = await asyncio.wait(
                 tasks, return_when=asyncio.FIRST_COMPLETED
             )
@@ -113,19 +121,18 @@ async def _cidr_filter_stage(
 
 
 async def _connect_test_stage(
-    config: AppConfig, db: Database, toolchain: BinaryToolchain, candidates_count: int
+    config: ConnectTestConfig, db: Database,
+    toolchain: BinaryToolchain, candidates_count: int
 ) -> None:
     LOGGER.debug("Connect test starting")
 
-    max_tasks = 50
-
     candidate_reader = BatchCandidateReader(
-        db, toolchain, max_tasks * 4, kind=TestResultKind.CONNECT
+        db, toolchain, config.concurrent_tasks * 4, kind=TestResultKind.CONNECT
     )
 
     result_writer = BatchTestResultWriter(db, 1000)
 
-    proxy_tester = ConnectTester(config.tester, result_writer)
+    proxy_tester = ConnectTester(config, result_writer)
     tasks: set[asyncio.Task] = set()
 
     pbar = tqdm(
@@ -144,7 +151,7 @@ async def _connect_test_stage(
         task = asyncio.create_task(proxy_tester.test_proxy(res[0]))
         tasks.add(task)
 
-        if len(tasks) >= max_tasks:
+        if len(tasks) >= config.concurrent_tasks:
             completed, tasks = await asyncio.wait(
                 tasks, return_when=asyncio.FIRST_COMPLETED
             )
@@ -331,15 +338,20 @@ async def run_once(config: AppConfig, db: Database, toolchain: BinaryToolchain) 
 
         db.move_dead_proxies(config.tester.dead_ttl_days)
         candidates_count = db.count_candidate_proxies()
+        await _cooldown(config.tester.cooldown_time)
 
-    LOGGER.info("Selected for connect stage: %s", candidates_count)
-    await _connect_test_stage(config, db, toolchain, candidates_count)
+    if config.tester.connect_test:
+        LOGGER.info("Selected for connect stage: %s", candidates_count)
+        await _connect_test_stage(config.tester.connect_test, db,
+                                  toolchain, candidates_count)
 
-    db.move_dead_proxies(config.tester.dead_ttl_days)
-    candidates_count = db.count_candidate_proxies()
+        db.move_dead_proxies(config.tester.dead_ttl_days)
+        candidates_count = db.count_candidate_proxies()
+        await _cooldown(config.tester.cooldown_time)
 
     LOGGER.info("Selected for url stage: %s", candidates_count)
     await _url_test_stage(config, db, toolchain, candidates_count)
+    await _cooldown(config.tester.cooldown_time)
 
     if config.filter.geoip:
         db.geoip_filter_proxies(config.filter.geoip)

@@ -6,7 +6,7 @@ import socket
 from typing import Any
 
 from app.batch_operations import BatchTestResultWriter
-from app.config import TesterConfig
+from app.config import ConnectTestConfig
 from app.helpers import extract_address
 from app.models import (
     CandidateProxy,
@@ -20,7 +20,7 @@ LOGGER = logging.getLogger(__name__)
 
 class ConnectTester:
     def __init__(
-        self, config: TesterConfig, batch_writer: BatchTestResultWriter
+        self, config: ConnectTestConfig, batch_writer: BatchTestResultWriter
     ) -> None:
         self._batch_writer = batch_writer
         self._config = config
@@ -98,7 +98,7 @@ class ConnectTester:
 
         protocol = str(outbound.get("protocol", "")).lower()
 
-        timeout = self._config.url_test.timeout
+        timeout = self._config.timeout
 
         test_func = (
             self._test_udp
@@ -108,7 +108,7 @@ class ConnectTester:
 
         last_reason = TestResultReasons.CONNECT_FAILED
 
-        for attempt in range(self._config.test_attempts):
+        for attempt in range(self._config.attempts):
             success, reason = await test_func(host, port, timeout)
             last_reason = reason
 
@@ -123,7 +123,7 @@ class ConnectTester:
                 )
                 return True
 
-            if attempt < self._config.test_attempts - 1:
+            if attempt < self._config.attempts - 1:
                 await asyncio.sleep(0.2)
 
         self._batch_writer.add(
