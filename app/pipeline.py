@@ -336,7 +336,7 @@ async def run_once(config: AppConfig, db: Database, toolchain: BinaryToolchain) 
 
         await _cidr_filter_stage(config.filter.cidr, db, toolchain, candidates_count)
 
-        db.move_dead_proxies(config.tester.dead_ttl_days)
+        db.move_dead_proxies(config.dead_ttl)
         candidates_count = db.count_candidate_proxies()
         await _cooldown(config.tester.cooldown_time)
 
@@ -345,7 +345,7 @@ async def run_once(config: AppConfig, db: Database, toolchain: BinaryToolchain) 
         await _connect_test_stage(config.tester.connect_test, db,
                                   toolchain, candidates_count)
 
-        db.move_dead_proxies(config.tester.dead_ttl_days)
+        db.move_dead_proxies(config.dead_ttl)
         candidates_count = db.count_candidate_proxies()
         await _cooldown(config.tester.cooldown_time)
 
@@ -360,7 +360,7 @@ async def run_once(config: AppConfig, db: Database, toolchain: BinaryToolchain) 
         duplicates_count = db.mark_dead_duplicate_ip_proxies()
         LOGGER.info("Marked dead %s duplicates", duplicates_count)
 
-    db.move_dead_proxies(config.tester.dead_ttl_days)
+    db.move_dead_proxies(config.dead_ttl)
 
     speed_candidates_count = db.count_candidate_proxies()
     LOGGER.info("Selected for speed stage: %s", speed_candidates_count)
@@ -369,7 +369,7 @@ async def run_once(config: AppConfig, db: Database, toolchain: BinaryToolchain) 
     await _speed_test_stage(
         config, db, toolchain, stop_controller, speed_candidates_count
     )
-    db.move_dead_proxies(config.tester.dead_ttl_days)
+    db.move_dead_proxies(config.dead_ttl)
 
     final_selection_count = db.count_candidate_proxies_with_status("speed_ok")
 

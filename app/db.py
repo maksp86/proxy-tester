@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
-from .config import GeoIPConfig
+from .config import GeoIPConfig, DeadTTLConfig
 from .models import CandidateProxy, ProxyTestResult, Subscripton
 
 
@@ -344,7 +344,8 @@ class Database:
     def count_candidate_proxies(self) -> int:
         with self._write_lock:
             with self.connect() as conn:
-                num_fresh = conn.execute("SELECT COUNT(*) FROM proxies").fetchone()[0]
+                num_fresh = conn.execute(
+                    "SELECT COUNT(*) FROM proxies").fetchone()[0]
                 return num_fresh
 
     def count_candidate_proxies_with_status(self, status: str) -> int:
@@ -355,33 +356,46 @@ class Database:
                 ).fetchone()[0]
                 return num_fresh
 
-    def move_dead_proxies(self, ttl_days: int) -> None:
+    def move_dead_proxies(self, ttl_config: DeadTTLConfig) -> None:
+        sql = f"""
+        INSERT INTO dead_proxies (
+            proxy_hash, raw_link, scheme, reason, created_at, expires_at
+        )
+        SELECT
+            p.proxy_hash,
+            p.raw_link,
+            p.scheme,
+            CASE COALESCE(p.reason, 'other')
+                WHEN 'cidr_discarded' THEN 'cidr_discarded'
+                WHEN 'connect_failed' THEN 'connect_failed'
+                WHEN 'latency_exceeded' THEN 'latency_exceeded'
+                WHEN 'speed_test_failed' THEN 'speed_test_failed'
+                WHEN 'speed_below_threshold' THEN 'speed_below_threshold'
+                WHEN 'url_test_failed' THEN 'url_test_failed'
+                WHEN 'discarded_filtering' THEN 'discarded_filtering'
+                ELSE 'other'
+            END AS reason,
+            strftime('%s', 'now') AS created_at,
+            CASE COALESCE(p.reason, 'other')
+                WHEN 'cidr_discarded' THEN strftime('%s', 'now', '+{ttl_config.cidr_discarded} days')
+                WHEN 'connect_failed' THEN strftime('%s', 'now', '+{ttl_config.connect_failed} days')
+                WHEN 'latency_exceeded' THEN strftime('%s', 'now', '+{ttl_config.latency_exceeded} days')
+                WHEN 'speed_test_failed' THEN strftime('%s', 'now', '+{ttl_config.speed_test_failed} days')
+                WHEN 'speed_below_threshold' THEN strftime('%s', 'now', '+{ttl_config.speed_below_threshold} days')
+                WHEN 'url_test_failed' THEN strftime('%s', 'now', '+{ttl_config.url_test_failed} days')
+                WHEN 'discarded_filtering' THEN strftime('%s', 'now', '+{ttl_config.discarded_filtering} days')
+                ELSE strftime('%s', 'now', '+{ttl_config.other} days')
+            END AS expires_at
+        FROM proxies p
+        WHERE p.last_status = 'dead';
+
+        DELETE FROM proxies
+        WHERE last_status = 'dead';
+        """
+
         with self._write_lock:
             with self.connect() as conn:
-                cur = conn.cursor()
-                cur.execute(f"""
-                    INSERT INTO dead_proxies (
-                        proxy_hash, raw_link, scheme, reason, created_at, expires_at
-                    )
-                    SELECT
-                        p.proxy_hash,
-                        p.raw_link,
-                        p.scheme,
-                        COALESCE(p.reason, 'dead'),
-                        strftime('%s','now'),
-                        strftime('%s','now', '+{ttl_days} days')
-                    FROM proxies p
-                    WHERE p.last_status = 'dead'
-                    ON CONFLICT(proxy_hash) DO UPDATE SET
-                        expires_at = excluded.expires_at,
-                        reason = excluded.reason
-                """)
-
-                cur.execute("""
-                    DELETE FROM proxies
-                    WHERE last_status = 'dead'
-                """)
-
+                conn.executescript(sql)
                 conn.commit()
 
     def geoip_filter_proxies(self, geoip_config: GeoIPConfig):
@@ -392,7 +406,8 @@ class Database:
             with self.connect() as conn:
                 cur = conn.cursor()
 
-                country_placeholders = ",".join("?" for _ in geoip_config.countries)
+                country_placeholders = ",".join(
+                    "?" for _ in geoip_config.countries)
                 filter_mode = " " if geoip_config.method == "exclude" else " NOT "
 
                 sql = f"""
@@ -401,15 +416,11 @@ class Database:
                         reason = 'discarded_filtering'
                     WHERE
                         last_status IN ('url_ok', 'speed_ok')
-
-                        AND (
-                            country IS NULL
-                            OR country{filter_mode}IN ({country_placeholders})
-                        )
+                        AND country IS NOT NULL
+                        AND country{filter_mode}IN ({country_placeholders})
                 """
 
                 params = (*geoip_config.countries,)
-
                 cur.execute(sql, params)
                 conn.commit()
 
@@ -420,27 +431,29 @@ class Database:
                     WITH ranked AS (
                         SELECT
                             proxy_hash,
-                            RANK() OVER (
+                            ROW_NUMBER() OVER (
                                 PARTITION BY exit_ip
                                 ORDER BY
-                                    CASE WHEN latency_ms IS NULL THEN 1 ELSE 0 END,
-                                    latency_ms ASC
-                            ) AS rnk
+                                    latency_ms IS NULL,
+                                    latency_ms ASC,
+                                    proxy_hash ASC
+                            ) AS rn
                         FROM proxies
                         WHERE exit_ip IS NOT NULL
+                        AND last_status <> 'dead'
                     )
                     UPDATE proxies
                     SET
                         last_status = 'dead',
                         reason = 'duplicate'
-                    WHERE proxy_hash IN (
-                        SELECT proxy_hash
-                        FROM ranked
-                        WHERE rnk > 1
-                    )
-                    RETURNING proxy_hash
+                    WHERE last_status <> 'dead' 
+                        AND proxy_hash IN (
+                            SELECT proxy_hash FROM ranked WHERE rn > 1
+                        )
                     """)
-                return cursor.rowcount
+                cursor.execute("SELECT changes()")
+                row = cursor.fetchone()
+                return row[0] if row is not None else 0
 
     def cleanup_duplicate_dead_proxies(self) -> int:
         with self._write_lock:

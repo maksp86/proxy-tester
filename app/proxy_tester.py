@@ -58,9 +58,10 @@ class ProxyTester:
         )
         self._one_proxy_timeout = config.test_attempts * config.url_test.timeout
 
-        if geoip_config and geoip_config.path and geoip_config.path.exists():
+        if geoip_config and geoip_config.path:
             ensure_geoip_database(geoip_config.path, geoip_config.url)
-            self._tester_args.append(f"--geoip2-db-path={geoip_config.path.resolve()}")
+            if geoip_config.path.exists():
+                self._tester_args.append(f"--geoip2-db-path={geoip_config.path.resolve()}")
 
         if kind == TestResultKind.SPEED:
             worker_count = config.speed_test.worker_count

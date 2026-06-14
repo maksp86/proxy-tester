@@ -103,6 +103,7 @@ class ConnectTestConfig(BaseModel):
     concurrent_tasks: int = 50
     attempts: int = 3
 
+
 class TesterConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -111,7 +112,6 @@ class TesterConfig(BaseModel):
     connect_test: ConnectTestConfig | None = None
     target_final_count: int = 25
     test_attempts: int = 3
-    dead_ttl_days: int = 30
     cooldown_time: float = 10.0
 
     @field_validator("cooldown_time", mode="before")
@@ -247,6 +247,17 @@ class FilterConfig(BaseModel):
         return None if v == {} else v
 
 
+class DeadTTLConfig(BaseModel):
+    cidr_discarded: int = 30
+    connect_failed: int = 30
+    latency_exceeded: int = 30
+    other: int = 30
+    speed_test_failed: int = 30
+    speed_below_threshold: int = 30
+    url_test_failed: int = 30
+    discarded_filtering: int = 30
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -256,6 +267,8 @@ class AppConfig(BaseModel):
 
     tester: TesterConfig = Field(default_factory=TesterConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
+
+    dead_ttl: DeadTTLConfig = Field(default_factory=DeadTTLConfig)
 
     export_options: ExportConfig = Field(default_factory=ExportConfig)
 
